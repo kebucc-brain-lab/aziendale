@@ -10,7 +10,25 @@
 org: "kebucc-brain-lab"
 repo: "aziendale"
 verifica_semantica: richiesta
-persone: {}
-aree: {}
-responsabile_default: ""
+persone:
+  anna:
+    login: "kebucc"
+    area: "vendite"
+  bruno:
+    login: "bubotek"
+    area: "it"
+  carla:
+    login: "kebucc"
+    area: "supporto"
+aree:
+  it:
+    responsabile: "bruno"
+    team: "direzione"
+  supporto:
+    responsabile: "anna"
+    team: "azienda"
+  vendite:
+    responsabile: "anna"
+    team: "vendite"
+responsabile_default: "anna"
 aggiornato: 2026-10-21
