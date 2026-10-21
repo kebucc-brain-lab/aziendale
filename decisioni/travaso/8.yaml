@@ -1,0 +1,35 @@
+issue: 8
+kind: travaso
+persona: bruno
+path: nodi/it/entities/acme.md
+dest: sources/travaso/bruno/bruno/nodi/it/entities/acme.md
+brain: bruno
+versione: 3
+hash_file: 43f73a3b9379c619866378ff7310842f87636b55712a3c184bc3231b7e3aa23f
+base_sha: 197047125f0254efc4e0fb7fb3864e5617e71094
+head_sha: ''
+fatti:
+- soggetto: entities/acme
+  chiave: referente
+  nuovo: Mario Rossi
+  nuovo_norm: txt:mario rossi
+  canon: Bianca Neri
+  canon_norm: txt:bianca neri
+  canon_persona: anna
+  canon_area: vendite
+  canon_nota: sources/travaso/anna/anna/entities/cliente-acme.md
+  canon_data: '2026-10-20'
+  contro_decisione: null
+  fonte: fatti
+esito: nuovo
+motivo: ''
+contesti: {}
+deciso_da: kebucc
+revisione: casella v3
+data: '2026-10-21'
+stato: applicata
+applicato:
+  pr: 0
+  sha: ''
+note_canon_marcate: []
+travaso_versione: 3.3.4
