@@ -202,23 +202,35 @@ def hits_json(res: dict) -> dict:
     out = dict(res)
     out["hits"] = [{"stem": h.get("stem"), "path": h.get("path"), "node_path": h.get("node_path"),
                     "heading": h.get("heading", ""), "score": round(h.get("score", 0.0), 5),
-                    "text": h.get("text", ""), "via": h.get("_via", ""), "is_session": h.get("is_session", False)}
+                    "text": h.get("text", ""), "via": h.get("_via", ""), "is_session": h.get("is_session", False),
+                    "zone": h.get("zone", "vault"), "persona": h.get("persona", ""), "brain_src": h.get("brain_src", ""),
+                    "superato": h.get("superato", "")}            # v3.3 giro 3, #6: l'avviso del registro arriva all'agente
                    for h in res["hits"]]
     return out
 
 
-def print_human(res: dict) -> None:
-    print(f"== {len(res['hits'])} chunk recuperati (nodo '{res['node']}', dominio {res['node_paths']}) "
-          f"-- sintetizza tu citando gli stem ==")
+def context_text(res: dict) -> str:
+    """Contesto per l'agente (stesso testo di `print_human`): per ogni chunk stem, nodo, score, provenienza del travaso e
+    l'AVVISO `superato da #n` / `entrambi (#n)` del registro delle decisioni (v3.3 giro 3, #6)."""
+    lines = [f"== {len(res['hits'])} chunk recuperati (nodo '{res.get('node')}', dominio {res.get('node_paths')}) "
+             f"-- sintetizza tu citando gli stem =="]
     for h in res["hits"]:
         via = f" via:{h['_via']}" if h.get("_via") else ""
-        print(f"\n--- [{h['stem']}] nodo={h.get('node_path', '?')} score={h['score']:.3f}{via} ---")
-        print(h["text"].strip())
-    print("-" * 70)
-    print("FONTI:", ", ".join(res["files"][:8]) or "-")
-    sig = res["signals"]
-    print(f"CONFIDENZA: {res['confidence']} (dense_top={sig.get('dense_top')} sparse_top={sig.get('sparse_top')} "
-          f"dense_score={sig.get('dense_score')} soglia={sig.get('threshold')})")
+        prov = f" [travaso di {h.get('persona')}, brain {h.get('brain_src')}]" if h.get("zone") == "travaso" else ""
+        lines.append(f"\n--- [{h['stem']}] nodo={h.get('node_path', '?')} score={float(h.get('score') or 0):.3f}{via}{prov} ---")
+        if h.get("superato"):
+            lines.append(f"AVVISO: {h['superato']} (registro decisioni/travaso: questo contenuto non vale piu' cosi' com'e')")
+        lines.append(str(h.get("text") or "").strip())
+    lines.append("-" * 70)
+    lines.append("FONTI: " + (", ".join((res.get("files") or [])[:8]) or "-"))
+    sig = res.get("signals") or {}
+    lines.append(f"CONFIDENZA: {res.get('confidence')} (dense_top={sig.get('dense_top')} sparse_top={sig.get('sparse_top')} "
+                 f"dense_score={sig.get('dense_score')} soglia={sig.get('threshold')})")
+    return "\n".join(lines)
+
+
+def print_human(res: dict) -> None:
+    print(context_text(res))
 
 
 def main(argv: list[str] | None = None) -> int:
