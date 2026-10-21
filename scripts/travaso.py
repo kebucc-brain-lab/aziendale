@@ -56,7 +56,7 @@ import repo_check  # noqa: E402
 import brain_sync as bs  # noqa: E402
 from secrets_scan import mask_secrets  # noqa: E402
 
-TRAVASO_VERSION = "3.3.5"
+TRAVASO_VERSION = "3.3.6"
 EXIT_CONFIG, EXIT_STOP, EXIT_REFUSED, EXIT_DEST, EXIT_DELETIONS, EXIT_DEFERRED, EXIT_VERIFY = 3, 7, 8, 9, 11, 12, 13
 BRANCH_AUTO = "travaso/auto/{persona}"
 BRANCH_ATTESA = "travaso/attesa/{persona}"
@@ -3009,19 +3009,15 @@ def _reevaluate_decision(ctx: Ctx, tx: Tx, wt: Path, n: int, pr: dict, issue: di
     return {**pr, "state": "CLOSED", "renewed": True}
 
 def complete_decision(ctx: Ctx, tx: Tx, issue: dict, m: dict, pr: dict, choice: str) -> str:
-    """Passi idempotenti DOPO la preparazione (anche in ripresa dopo un crash, #8): commento `preparata`, pulizia
-    dell'attesa (kind travaso), status aggregato sul head della PR umana (kind pr)."""
+    """Passi idempotenti DOPO la preparazione (anche in ripresa dopo un crash, #8): commento `preparata`, commento "vale il
+    canon", status aggregato sul head della PR umana (kind pr). Il file deciso RESTA nel branch attesa finche' la PR deciso
+    non e' FUSA (N14, giro 6): e' lo snapshot verificabile (hash nel registro) con cui si riprepara se la scelta cambia."""
     n = int(issue["number"])
     persona = str(m.get("persona") or "")
     marker = f"travaso-stato: preparata (PR #{pr['number']})"
     if not any(marker in (c.get("body") or "") for c in issue.get("comments") or []):
-        issue_comment(ctx, n, f"{marker}: la issue si chiude quando la PR e' fusa.")
+        issue_comment(ctx, n, f"{marker}: la issue si chiude quando la PR e' fusa; il file resta in attesa fino ad allora.")
     if m.get("kind") == "travaso":
-        dest = str(m.get("dest") or "")
-        if _attesa_blob(ctx, persona, dest) is not None:
-            _pr2, _h2, left, _st2 = rebuild_attesa(ctx, tx, persona, {}, {}, {dest}, None)
-            if left and _pr2 is not None:
-                attesa_status_and_issues(ctx, tx, persona, str(m.get("brain") or ""), [], _pr2, _h2, left, staged_changed=_st2)
         if choice == "canon" and not any("vale il canon:" in (c.get("body") or "") for c in issue.get("comments") or []):
             issue_comment(ctx, n, f"vale il canon: `{m.get('path')}` resta fuori finche' il contenuto non cambia; "
                                   f"{persona} vedra' la riga al prossimo rito.")
@@ -3030,16 +3026,53 @@ def complete_decision(ctx: Ctx, tx: Tx, issue: dict, m: dict, pr: dict, choice: 
     return f"#{n}: vale {choice} -> PR deciso #{pr['number']}"
 
 
+def _drop_from_attesa(ctx: Ctx, tx: Tx, m: dict) -> None:
+    """Dopo il MERGE della PR deciso (N14): il file deciso esce dal branch attesa (PR attesa aggiornata o chiusa)."""
+    persona, dest = str(m.get("persona") or ""), str(m.get("dest") or "")
+    if not dest or _attesa_blob(ctx, persona, dest) is None:
+        return
+    pr2, h2, left, st2 = rebuild_attesa(ctx, tx, persona, {}, {}, {dest}, None)
+    if left and pr2 is not None:
+        attesa_status_and_issues(ctx, tx, persona, str(m.get("brain") or ""), [], pr2, h2, left, staged_changed=st2)
+
+def _current_decision_problem(ctx: Ctx, issue: dict, m: dict, current) -> str:
+    """Ripresa (N11): la decisione CORRENTE sulla issue riletta deve esserci, essere dimostrabile e autorizzata, con gli
+    stessi controlli della prima acquisizione. "" = tutto bene, altrimenti il motivo della sospensione."""
+    if current is None:
+        return "decisione assente o non dimostrabile (caselle vuote o incompatibili, spunta non attribuibile)"
+    ok, why = is_authorized(ctx, issue, m, current[1])
+    if not ok:
+        return f"@{current[1]} non e' (piu') autorizzato: possono {why}"
+    return ""
+
+
+def _suspend(ctx: Ctx, n: int, m: dict, pr: dict | None, problem: str) -> str:
+    """Sospensione (N11 residuo): NESSUN success ne' auto-merge. Status failure sul head della PR deciso, PR chiusa con
+    commento (il file resta in attesa: N14), `in-applicazione` tolto, commento nella issue. Si riparte con una decisione nuova."""
+    if pr is not None:
+        head = str(pr.get("headRefOid") or "")
+        if head:
+            try:
+                post_status(ctx, head, "failure", f"decisione assente o revocata: ridecidi (#{n}); base:{ctx.base_sha[:7]}")
+            except Stop as e:
+                say(f"AVVISO: status di sospensione non postato su {head[:7]}: {e.msg}")
+        pr_close(ctx, int(pr["number"]), f"decisione assente o revocata ({problem}): questa PR non si fonde; il file resta in attesa, "
+                                         "ridecidi nella issue.")
+    issue_comment(ctx, n, f"travaso-stato: sospesa — {problem}. " + (f"PR deciso #{pr['number']} chiusa, nessun merge; " if pr else "")
+                  + f"il materiale resta in attesa: ridecidi con UNA casella o un commento `vale: nuovo|canon|entrambi v{m.get('versione', 1)}`.")
+    issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])
+    return f"#{n}: sospesa ({problem})"
+
+
 def finalize_if_merged(ctx: Ctx, tx: Tx, issue: dict, m: dict) -> str | None:
-    """Issue con `in-applicazione` (lock gia' acquisito, issue riletta). PR deciso MERGED -> chiude la issue SOLO se il
-    registro su main coincide con la proposta corrente (N12: una PR di una proposta precedente non "applica" la v2: la
-    proposta resta aperta e si riprepara); OPEN -> se la scelta corrente diverge da quella acquisita (N11) la PR si chiude
-    con commento e si riprepara, altrimenti riallinea/rivaluta e completa; assente -> None (si riprepara)."""
+    """Issue con `in-applicazione` (lock gia' acquisito, issue riletta). La decisione CORRENTE si rivalida come alla prima
+    acquisizione (N11): assente, non dimostrabile o non autorizzata = sospensione (`_suspend`), mai success/auto-merge.
+    PR deciso MERGED -> chiude la issue SOLO se il registro su main coincide con la proposta corrente (N12) e toglie il file
+    dall'attesa (N14); OPEN -> scelta divergente da quella acquisita = PR chiusa e si riprepara (N11), altrimenti
+    riallinea/rivaluta e completa; assente -> None (si riprepara)."""
     n = int(issue["number"])
     pr = pr_for_branch(ctx, BRANCH_DECISO.format(issue=n))
-    if pr is None:
-        return None
-    st = str(pr.get("state")).upper()
+    st = str((pr or {}).get("state") or "").upper()
     reg = _register_entry_on_main(ctx, n)
     acquired = _choice_from_comments(issue) or str(reg.get("esito") if reg else "")
     current = read_decision(ctx, issue, m)                # scelta CORRENTE sulla issue fresca (N11)
@@ -3055,32 +3088,35 @@ def finalize_if_merged(ctx: Ctx, tx: Tx, issue: dict, m: dict) -> str | None:
         if current is not None and current[0] != choice:
             issue_comment(ctx, n, f"travaso-stato: la spunta corrente dice `vale {current[0]}` ma e' stata applicata `vale {choice}` "
                                   f"(PR #{pr['number']} fusa, registro su main): per cambiare serve una nuova proposta.")
-        if m.get("kind") == "travaso" and _attesa_blob(ctx, str(m.get("persona") or ""), str(m.get("dest") or "")) is not None:
-            complete_decision(ctx, tx, issue, m, pr, choice)
+        if m.get("kind") == "travaso":
+            _drop_from_attesa(ctx, tx, m)                 # N14: il file esce dall'attesa solo ORA
         issue_labels(ctx, n, add=[LABEL_DECISO], remove=[LABEL_DA_DECIDERE, LABEL_IN_APPLICAZIONE])
         issue_comment(ctx, n, f"travaso-stato: applicata ({sha[:7]}) — PR #{pr['number']} fusa; decisione nel registro `{REGISTER_DIR}/{n}.yaml`.")
         issue_close(ctx, n)                                   # REST (fatto live: niente `gh issue close`)
         if m.get("kind") == "pr":
             refresh_pr_status(ctx, int(m.get("pr") or 0), str(m.get("head_sha") or ""))
         return f"#{n} applicata (PR #{pr['number']} fusa): issue chiusa"
-    if st == "OPEN":
-        if current is not None and acquired and current[0] != acquired:
-            # N11 (ripresa): la scelta e' cambiata dopo l'acquisizione: la PR della scelta acquisita non si finalizza
-            pr_close(ctx, int(pr["number"]), f"scelta cambiata dopo l'acquisizione (acquisita: vale {acquired}; ora: vale {current[0]}): "
-                                             "questa PR non vale piu'; si riprepara con la scelta corrente.")
-            issue_comment(ctx, n, f"travaso-stato: scelta cambiata dopo l'acquisizione (acquisita: vale {acquired}; ora: vale {current[0]} "
-                                  f"di @{current[1]}): la PR deciso #{pr['number']} e' stata chiusa, si riprepara con la scelta corrente.")
-            issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])
-            return None
-        pr = _ensure_deciso_pr(ctx, tx, n, pr, issue, m, acquired)
-        if pr.get("renewed"):
-            return f"#{n}: proposta rinnovata (nuova contraddizione su main), serve una nuova decisione"
-        if pr.get("stale"):
-            issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])   # N9: la vecchia PR non vale; si riprepara con la proposta corrente
-            return None
-        complete_decision(ctx, tx, issue, m, pr, acquired)
-        return f"#{n} preparata (PR #{pr['number']} in attesa dei check)"
-    return None
+    problem = _current_decision_problem(ctx, issue, m, current)
+    if problem:
+        return _suspend(ctx, n, m, pr if st == "OPEN" else None, problem)
+    if pr is None or st != "OPEN":
+        return None
+    if acquired and current[0] != acquired:
+        # N11 (ripresa): la scelta e' cambiata dopo l'acquisizione: la PR della scelta acquisita non si finalizza
+        pr_close(ctx, int(pr["number"]), f"scelta cambiata dopo l'acquisizione (acquisita: vale {acquired}; ora: vale {current[0]}): "
+                                         "questa PR non vale piu'; si riprepara con la scelta corrente.")
+        issue_comment(ctx, n, f"travaso-stato: scelta cambiata dopo l'acquisizione (acquisita: vale {acquired}; ora: vale {current[0]} "
+                              f"di @{current[1]}): la PR deciso #{pr['number']} e' stata chiusa, si riprepara con la scelta corrente.")
+        issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])
+        return None
+    pr = _ensure_deciso_pr(ctx, tx, n, pr, issue, m, acquired)
+    if pr.get("renewed"):
+        return f"#{n}: proposta rinnovata (nuova contraddizione su main), serve una nuova decisione"
+    if pr.get("stale"):
+        issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])   # N9: la vecchia PR non vale; si riprepara con la proposta corrente
+        return None
+    complete_decision(ctx, tx, issue, m, pr, acquired)
+    return f"#{n} preparata (PR #{pr['number']} in attesa dei check)"
 
 def _register_entry_on_main(ctx: Ctx, n: int) -> dict:
     raw = show_main(ctx, f"{REGISTER_DIR}/{n}.yaml")
