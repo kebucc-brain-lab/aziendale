@@ -117,7 +117,8 @@ def print_exact(res: dict) -> None:
     if trav:
         print(f"== travaso ({len(trav)} righe in {len({h['source'] for h in trav})} file: copia grezza, non ancora compilata) ==")
         for h in trav:
-            print(f"  [{h.get('persona', '?')}/{h.get('brain_src', '?')}] {h['source']}:{h['line']}: {h['text']}")
+            print(f"  [{h.get('persona', '?')}/{h.get('brain_src', '?')}] {h['source']}:{h['line']}: {h['text']}"
+                  + (f"  (avviso: {h['avviso']})" if h.get("avviso") else ""))      # giro 4, #6: anche il raw superato lo dice
     if res["truncated"]:
         print(f"  ... e altre {res['total'] - len(res['hits'])} righe (alza --limit)")
     if not res["hits"]:
