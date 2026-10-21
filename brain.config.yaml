@@ -9,7 +9,7 @@ mode: federated
 kind: company
 root: ''
 master_root: ''
-template_version: 3.2.1-rc1
+template_version: "3.3.0-rc1"
 agents:
 - claude
 - codex
