@@ -836,6 +836,35 @@ def travaso_provenance(rel: str) -> tuple[str, str, str] | None:
     return parts[2], parts[3], "/".join(parts[4:])
 
 
+def register_marks(root: Path) -> dict[str, str]:
+    """Registro delle decisioni del travaso (`decisioni/travaso/<n>.yaml` nel working tree): path -> avviso per `ask --exact`
+    e per il payload RAG (v3.3 giro 2, #6). Esito `nuovo`: le fonti/note canon superate -> "superato da #n"; `entrambi`: il
+    file deciso e le note citate -> "entrambi (#n): contesti nuovo=...; canon=...". File illeggibili ignorati."""
+    base = Path(root) / "decisioni" / "travaso"
+    out: dict[str, str] = {}
+    if not base.is_dir():
+        return out
+    for p in sorted(base.glob("*.yaml")):
+        try:
+            e = load_yaml_file(p)
+        except ConfigError:
+            continue
+        if not isinstance(e, dict) or not e.get("issue"):
+            continue
+        n, esito = e.get("issue"), str(e.get("esito") or "")
+        notes = [str(f.get("canon_nota")) for f in (e.get("fatti") or []) if isinstance(f, dict) and f.get("canon_nota")]
+        if esito == "nuovo":
+            for nota in notes:
+                out[nota] = f"superato da #{n}" if nota not in out else out[nota] + f", #{n}"
+        elif esito == "entrambi":
+            c = e.get("contesti") if isinstance(e.get("contesti"), dict) else {}
+            tag = f"entrambi (#{n}): contesti nuovo={c.get('nuovo', 'non specificati')}; canon={c.get('canon', 'non specificati')}"
+            for nota in [str(e.get("dest") or "")] + notes:
+                if nota:
+                    out.setdefault(nota, tag)
+    return out
+
+
 def iter_travaso_files(root: Path) -> list[Path]:
     """File `.md`/`.txt` della zona `sources/travaso/<persona>/<brain>/**` (solo nel nodo radice): ingeriti nel RAG con
     `zone: travaso`, inclusi in `ask --exact` con la provenienza, MAI lintati (sources resta zona grezza)."""

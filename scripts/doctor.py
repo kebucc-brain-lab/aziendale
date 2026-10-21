@@ -50,7 +50,7 @@ try:
 except ImportError:  # pragma: no cover
     render = None
 
-DOCTOR_VERSION = "3.2.1-rc1"
+DOCTOR_VERSION = "3.3.0-rc1"
 CONFIG_NAMES = ["CLAUDE.md", "CLAUDE.local.md", ".claude", ".mcp.json", "AGENTS.md"]
 NODE_MARKERS = ["nodo.md", "brain.yaml"]
 MANIFEST_NAME = ".template-manifest.json"

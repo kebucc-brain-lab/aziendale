@@ -62,13 +62,14 @@ def exact_hits(term: str, root: Path, node: kc.Node, nodes: list[kc.Node] | None
         # v3.3 (par. 4): la zona travaso del nodo radice, DOPO le note compilate, con la provenienza nel risultato
         for p in kc.iter_travaso_files(root):
             sources.append((p.relative_to(Path(root).resolve()).as_posix() if p.is_absolute() else str(p), p, ".", "travaso"))
+    marks = kc.register_marks(root)                       # v3.3 giro 2 (#6): registro delle decisioni, anche per il raw
     for rel, path, np_, kind in sources:
         try:
             text_all = kc.read_text(path)
         except OSError:
             continue
         lines = text_all.splitlines()
-        superseded = _superseded_by(text_all) if kind == "note" else None
+        superseded = (_superseded_by(text_all) if kind == "note" else None) or (marks.get(rel) or None)
         prov = kc.travaso_provenance(rel) if kind == "travaso" else None
         for i, ln in enumerate(lines, 1):
             if needle in ln.lower():
@@ -81,7 +82,7 @@ def exact_hits(term: str, root: Path, node: kc.Node, nodes: list[kc.Node] | None
                     if prov:
                         hit["persona"], hit["brain_src"] = prov[0], prov[1]
                     if superseded:
-                        hit["avviso"] = f"superato da {superseded}"
+                        hit["avviso"] = superseded if superseded.startswith(("superato", "entrambi")) else f"superato da {superseded}"
                     hits.append(hit)
     return {"term": term, "node": node.path, "hits": hits, "total": total, "truncated": total > len(hits)}
 

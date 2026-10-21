@@ -702,8 +702,14 @@ def sync_org(run: Runner, root: Path, dest: Dest, paths: list[str], excludes: li
     if staged:
         _check_staged(run, root)
         if run.coerenza and not run.dry and run.ops_nodes is None:
-            # v3.3 (par. 14.11): i file incongruenti escono dallo staging e vanno su travaso/attesa/<persona> con issue
+            # v3.3 (par. 14.11): i file incongruenti escono dallo staging e vanno su travaso/attesa/<persona> con issue;
+            # un controllo FALLITO (exit != 0/12) = nessun commit (giro 2, #11)
             rc = run_travaso(root, "check", ["--staged", *_persona_args(root)], quiet=True)
+            if rc not in (0, 12):
+                run.git("reset", "-q")
+                print(f"controllo di coerenza dello staging fallito (exit {rc} di travaso.py check --staged): staging svuotato, "
+                      f"nessun commit (exit {EXIT_TRAVASO})")
+                raise SyncAbort(EXIT_TRAVASO)
             run.travaso_rc = _worst_rc(run.travaso_rc, rc)
             if run.git("diff", "--cached", "--quiet").returncode == 0:
                 staged = False
@@ -968,12 +974,7 @@ def travaso_target(root: Path) -> tuple[str, Path | None, str, str]:
             parsed = parse_github(remote_owner(clone)[1])
             if parsed is None or (parsed[0].lower(), parsed[1].lower()) != (cfg.get("owner", "").lower(), cfg.get("repo", "").lower()):
                 why = f"origin del clone {clone} non e' {cfg.get('owner')}/{cfg.get('repo')}"
-            else:
-                ty = clone / "travaso.yaml"
-                if ty.is_file():
-                    text = ty.read_text(encoding="utf-8-sig", errors="replace")
-                    if not re.search(rf"^\s+{re.escape(persona)}\s*:", text, re.M):
-                        why = f"persona `{persona}` assente in travaso.yaml del clone"
+            # la persona si valida su travaso.yaml di ORIGIN/MAIN dentro travaso.py, mai sulla copia locale (giro 2, #21)
         if why:
             return "mittente", None, persona, (f"TRAVASO NON CONFIGURATO: {why}. Clona il brain aziendale "
                                                f"({cfg.get('owner')}/{cfg.get('repo')}) e inizializzalo con scaffold/inizializza_clone.py "
@@ -987,11 +988,20 @@ def travaso_target(root: Path) -> tuple[str, Path | None, str, str]:
     return "", None, "", ""
 
 
+def _m(text: str) -> str:
+    """Mai segreti nei messaggi del wrapper (anche un path con un token dentro): maschera prima di stampare (#13)."""
+    try:
+        from secrets_scan import mask_secrets  # noqa: PLC0415
+        return mask_secrets(str(text))[0]
+    except ImportError:  # pragma: no cover
+        return str(text)
+
+
 def run_travaso(root: Path, sub: str, args: list[str], quiet: bool = True) -> int:
     """Esegue `travaso.py <sub> ...` con il python corrente (mittente: dal clone; ricevente: da se'). Output in chiaro."""
     role, script, persona, problem = travaso_target(root)
     if script is None:
-        print(problem or "TRAVASO NON CONFIGURATO: questo brain non dichiara `travaso:` in brain.yaml ne' github.travaso")
+        print(_m(problem or "TRAVASO NON CONFIGURATO: questo brain non dichiara `travaso:` in brain.yaml ne' github.travaso"))
         return EXIT_TRAVASO
     cmd = [sys.executable, str(script), sub, *args]
     if quiet and "--quiet" not in cmd:
@@ -1002,7 +1012,7 @@ def run_travaso(root: Path, sub: str, args: list[str], quiet: bool = True) -> in
     try:
         r = subprocess.run(cmd, cwd=str(script.parent.parent), env=env, stdin=subprocess.DEVNULL)
     except OSError as e:
-        print(f"travaso non eseguibile: {e}")
+        print(_m(f"travaso non eseguibile: {e}"))
         return EXIT_TRAVASO
     return r.returncode
 
@@ -1042,8 +1052,8 @@ def travaso_args(a, root: Path, role: str, persona: str, sub: str) -> list[str]:
         args.append("--scrivi")
     if sub == "stato" and role == "ricevente":
         args.append("--da-compilare")
-    if a.no_ingest and sub in ("send", "decisioni", "check"):
-        args.append("--no-ingest")
+    if a.no_ingest and sub in ("send", "decisioni", "check") and getattr(a, "travaso", None):
+        args.append("--no-ingest")                        # solo nel dispatch esplicito: il post-passo decide da solo (N1)
     if a.dry_run_git and sub in ("send", "decisioni", "check"):
         args.append("--dry-run-git")
     return args
@@ -1062,7 +1072,7 @@ def travaso_post_step(a, root: Path) -> int:
         print("travaso rinviato: --no-push")
         return 0
     if script is None:
-        print(problem)
+        print(_m(problem))
         return EXIT_TRAVASO
     print("\n== travaso ==")
     sub = "send" if role == "mittente" else "decisioni"
@@ -1120,8 +1130,11 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         role, script, persona, problem = travaso_target(root)
         if script is None:
-            print(problem or "TRAVASO NON CONFIGURATO: questo brain non dichiara `travaso:` (mittente) ne' github.travaso: true (ricevente) in brain.yaml")
+            print(_m(problem or "TRAVASO NON CONFIGURATO: questo brain non dichiara `travaso:` (mittente) ne' github.travaso: true (ricevente) in brain.yaml"))
             return EXIT_TRAVASO
+        if a.travaso in ("send", "decisioni", "check") and (a.no_push or a.no_commit):
+            print(f"travaso rinviato: {'--no-push' if a.no_push else '--no-commit'} (giro 2, #12: nessuna pubblicazione)")
+            return 0
         rc = run_travaso(root, a.travaso, travaso_args(a, root, role, persona, a.travaso), quiet=a.travaso != "stato")
         return travaso_exit(rc)
     try:
