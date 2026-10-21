@@ -29,7 +29,7 @@ revisione: casella v3
 data: '2026-10-21'
 stato: applicata
 applicato:
-  pr: 0
-  sha: ''
+  pr: 12
+  sha: de1764e0ca5cf1062a88f1adfae2254cb0c90668
 note_canon_marcate: []
 travaso_versione: 3.3.4
