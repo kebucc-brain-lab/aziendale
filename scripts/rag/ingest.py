@@ -56,16 +56,31 @@ SESSIONS_PREFIX = "workspace/journal/sessions"
 # anche `persona` e `brain_src` (provenienza), cosi' il brain aziendale risponde subito con il materiale travasato.
 PAYLOAD_KEYS = ("stem", "path", "node_path", "brain_id", "title", "summary", "heading",
                 "text", "is_view", "is_session", "zone", "persona", "brain_src", "superato")
-_MARKS: dict[str, dict[str, str]] = {}    # cache per radice: registro delle decisioni (giro 2, #6)
+_MARKS: dict[str, tuple[str, dict[str, str]]] = {}    # cache per radice: (impronta del registro, path -> avviso) (giro 2/3, #6)
+
+
+def register_fingerprint(root: Path) -> str:
+    """Impronta del registro delle decisioni (`decisioni/travaso/*.yaml`: nome + sha256, ordinati): entra nello stato
+    dell'ingest, cosi' una decisione nuova forza il re-ingest dei file interessati anche a testo invariato (giro 3, #6)."""
+    base = Path(root) / "decisioni" / "travaso"
+    items: list[tuple[str, str]] = []
+    if base.is_dir():
+        for p in sorted(base.glob("*.yaml")):
+            try:
+                items.append((p.name, hashlib.sha256(p.read_bytes()).hexdigest()))
+            except OSError:
+                continue
+    return hashlib.sha256(json.dumps(items).encode("utf-8")).hexdigest()
 
 
 def _marks(root: Path | None) -> dict[str, str]:
     if root is None:
         return {}
-    key = str(root)
-    if key not in _MARKS:
-        _MARKS[key] = kc.register_marks(root)
-    return _MARKS[key]
+    key, fp = str(root), register_fingerprint(root)
+    cached = _MARKS.get(key)
+    if cached is None or cached[0] != fp:
+        _MARKS[key] = (fp, kc.register_marks(root))
+    return _MARKS[key][1]
 
 
 # ----------------------------------------------------------------------------
@@ -218,6 +233,8 @@ class NodeJob:
         self.meta_path = kc.state_file(root, node.path, "meta")
         self.state = _load_json(self.state_path, {})
         self.prev_files = dict(self.state.get("files", {}))
+        self.marks = _marks(root)                      # giro 3, #6: avviso `superato` per file, dal registro
+        self.register_fp = register_fingerprint(root)
         self.old_meta = _load_json(self.meta_path, {})
         self.config_changed = bool(self.state) and (
             self.state.get("model") != model or self.state.get("sparse_model") != sparse
@@ -230,8 +247,15 @@ class NodeJob:
 
     def save_state(self, model: str, sparse: str, coll: str) -> None:
         _dump_json(self.state_path, {"model": model, "sparse_model": sparse, "collection": coll,
-                                     "node_path": self.node.path, "files": self.new_files},
+                                     "node_path": self.node.path, "register_fp": self.register_fp, "files": self.new_files},
                    indent=2, sort_keys=True)
+
+    def file_state(self, relp: str, chunks: int) -> dict:
+        """Voce di stato di un file: hash, chunk e (se c'e') l'avviso `superato` con cui e' stato embeddato (#6)."""
+        d = {"hash": self.hashes[relp], "chunks": chunks}
+        if self.marks.get(relp):
+            d["superato"] = self.marks[relp]
+        return d
 
     def rebuild_nav(self, files: dict, dim, store: VectorStore, model: str, sparse: str, t0: float) -> None:
         """nav + meta interi dallo stato: id deterministici, niente vettori, per-macchina."""
@@ -311,7 +335,8 @@ def run(root: Path, node_paths=None, scope: str | None = None, rebuild: bool = F
         prefix = None if scope != "sessions" else _sessions_prefix(j.node.path) + "/"
         in_scope = (lambda r: True) if prefix is None else (lambda r, p=prefix: r.startswith(p))
         j.changed = sorted(r for r, h in j.hashes.items()
-                           if in_scope(r) and j.prev_files.get(r, {}).get("hash") != h)
+                           if in_scope(r) and (j.prev_files.get(r, {}).get("hash") != h
+                                               or (j.prev_files.get(r, {}).get("superato") or "") != j.marks.get(r, "")))
         j.removed = sorted(r for r in j.prev_files if in_scope(r) and r not in j.hashes)
         # sanity: stato pieno ma zero punti del nodo (rebuild morto a meta', wipe esterno)
         if not j.changed and not j.removed and j.prev_files and store.count([j.node.path]) == 0:
@@ -354,7 +379,7 @@ def run(root: Path, node_paths=None, scope: str | None = None, rebuild: bool = F
                     all_pts.extend(store.point(_pid(relp, i), dv[i], sv[i], _payload(c))
                                    for i, c in enumerate(chunks))
                 j.total_chunks += len(chunks)
-                j.new_files[relp] = {"hash": j.hashes[relp], "chunks": len(chunks)}
+                j.new_files[relp] = j.file_state(relp, len(chunks))
                 done += 1
                 if done % 50 == 0 or done == total:
                     print(f"  embed {done}/{total} file ({sum(x.total_chunks for x in jobs)} chunk, "
@@ -396,7 +421,7 @@ def run(root: Path, node_paths=None, scope: str | None = None, rebuild: bool = F
                         store.upsert(pts[b:b + BATCH])
                 j.total_chunks += len(chunks)
                 # stato scritto DOPO ogni file: un run interrotto riprende dal successivo
-                j.new_files[relp] = {"hash": j.hashes[relp], "chunks": len(chunks)}
+                j.new_files[relp] = j.file_state(relp, len(chunks))
                 j.save_state(model, sparse_model, coll)
                 if i % 25 == 0 or i == len(j.changed):
                     print(f"  [{j.node.path}] {i}/{len(j.changed)} file ({j.total_chunks} chunk, "

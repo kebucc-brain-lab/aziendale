@@ -172,6 +172,7 @@ GOVERNANCE_ROOT = (".github", "INDICE.md", "TEAM.md", "SECURITY.md", "decisioni"
 EXCLUDE_ALWAYS = ("workspace/dream", ".memory-backup")
 EXIT_TRAVASO = 10    # v3.3: il travaso (post-passo) e' fallito; il sync resta buono
 EXIT_VERIFY = 13     # v3.3: travaso "da verificare": l'agente deve eseguire `<id>-travaso verifica` e rilanciare con --verdetto
+EXIT_TRAVASO_DEFERRED = 12   # exit di travaso.py "rinviato" (offline): nel post-passo e' neutro, nel check --staged blocca il commit (#11)
 TRAVASO_SUBS = ("send", "verifica", "stato", "decisioni", "check")
 
 
@@ -705,7 +706,13 @@ def sync_org(run: Runner, root: Path, dest: Dest, paths: list[str], excludes: li
             # v3.3 (par. 14.11): i file incongruenti escono dallo staging e vanno su travaso/attesa/<persona> con issue;
             # un controllo FALLITO (exit != 0/12) = nessun commit (giro 2, #11)
             rc = run_travaso(root, "check", ["--staged", *_persona_args(root)], quiet=True)
-            if rc not in (0, 12):
+            if rc == EXIT_TRAVASO_DEFERRED:
+                # giro 3, #11: offline = controllo NON eseguito = nessun commit (un commit non controllato violerebbe "canon prima")
+                run.git("reset", "-q")
+                print(f"controllo non eseguito: offline, riprova (travaso.py check --staged exit {rc}): staging svuotato, "
+                      f"nessun commit (exit {EXIT_TRAVASO})")
+                raise SyncAbort(EXIT_TRAVASO)
+            if rc != 0:
                 run.git("reset", "-q")
                 print(f"controllo di coerenza dello staging fallito (exit {rc} di travaso.py check --staged): staging svuotato, "
                       f"nessun commit (exit {EXIT_TRAVASO})")
@@ -1050,6 +1057,8 @@ def travaso_args(a, root: Path, role: str, persona: str, sub: str) -> list[str]:
             args += ["--persona", persona]
     if sub == "decisioni" and a.scrivi:
         args.append("--scrivi")
+    if sub == "decisioni" and getattr(a, "sblocca", None) and getattr(a, "travaso", None):
+        args += ["--sblocca", str(a.sblocca)]            # solo nel dispatch esplicito: mai dal post-passo (#8)
     if sub == "stato" and role == "ricevente":
         args.append("--da-compilare")
     if a.no_ingest and sub in ("send", "decisioni", "check") and getattr(a, "travaso", None):
@@ -1111,6 +1120,8 @@ def main(argv: list[str] | None = None) -> int:
     tg.add_argument("--verdetto", default=None, help="review_id del pacchetto verificato (con --travaso send)")
     tg.add_argument("--pr", type=int, default=None, help="numero della PR (con --travaso check)")
     tg.add_argument("--staged", action="store_true", help="controlla lo staging del brain aziendale (con --travaso check)")
+    tg.add_argument("--sblocca", type=int, default=None, metavar="ISSUE",
+                    help="toglie a mano il lock stantio della issue (processo morto), poi applica (con --travaso decisioni)")
     tg.add_argument("--approvo", action="store_true", help="approva la zona protetta (con --travaso check --pr)")
     tg.add_argument("--scrivi", action="store_true", help="rigenera decisioni/TRAVASO.md (con --travaso decisioni)")
     tg.add_argument("--ferma", action="append", default=[], metavar="PATH", help="ferma un pezzo in piu' (con --travaso send)")

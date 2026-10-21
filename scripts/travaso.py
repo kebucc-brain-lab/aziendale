@@ -47,6 +47,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kb_config as kc  # noqa: E402
@@ -54,7 +55,7 @@ import repo_check  # noqa: E402
 import brain_sync as bs  # noqa: E402
 from secrets_scan import mask_secrets  # noqa: E402
 
-TRAVASO_VERSION = "3.3.1"
+TRAVASO_VERSION = "3.3.2"
 EXIT_CONFIG, EXIT_STOP, EXIT_REFUSED, EXIT_DEST, EXIT_DELETIONS, EXIT_DEFERRED, EXIT_VERIFY = 3, 7, 8, 9, 11, 12, 13
 BRANCH_AUTO = "travaso/auto/{persona}"
 BRANCH_ATTESA = "travaso/attesa/{persona}"
@@ -228,10 +229,16 @@ class Ctx:
         return self.run.gh(*args, write=write, input_text=input_text)
 
     def gh_json(self, *args: str):
-        """Lettura JSON da gh; None su errore (chi chiama decide)."""
+        """Lettura JSON da gh. 404 / "non trovato" = None (assenza); ogni ALTRO errore = Stop 9 (#24): mai confondere un
+        errore di rete o di autorizzazione con un'assenza."""
         r = self.gh(*args)
-        if r is None or r.returncode != 0:
-            return None
+        if r is None:
+            raise Stop(EXIT_DEFERRED, "travaso rinviato: gh assente o senza risposta")
+        if r.returncode != 0:
+            err = ((r.stderr or "") + (r.stdout or "")).lower()
+            if "404" in err or "not found" in err or "could not resolve" in err or "no pull requests found" in err:
+                return None
+            raise Stop(EXIT_DEST, f"gh {' '.join(args[:3])} in errore: {_out((r.stderr or r.stdout or '').strip(), 160)}")
         try:
             return json.loads(r.stdout)
         except ValueError:
@@ -308,7 +315,8 @@ def _check_link_chain(label: str, orig: Path, code: int) -> None:
 
 def open_ctx(root_arg: str | None, dry: bool, quiet: bool, no_ingest: bool = False) -> Ctx:
     """Clone del brain aziendale = radice del motore (come gli altri script), oppure --root. Nessuna mutazione.
-    I collegamenti si controllano sul path ORIGINALE (argomento o posizione dello script), prima di risolverlo."""
+    I collegamenti si controllano sul path ORIGINALE (argomento o posizione dello script), prima di risolverlo; un
+    git-common-dir fuori dal clone (`.git` file) si controlla con il suo genitore (#5)."""
     orig = Path(root_arg) if root_arg else Path(sys.argv[0]).parent.parent if sys.argv and sys.argv[0] else Path.cwd()
     _check_link_chain("il clone del brain aziendale", orig, EXIT_DEST)
     try:
@@ -316,12 +324,29 @@ def open_ctx(root_arg: str | None, dry: bool, quiet: bool, no_ingest: bool = Fal
     except kc.ConfigError as e:
         raise Stop(EXIT_CONFIG, f"clone del brain aziendale non riconosciuto: {e}") from e
     _check_link_base("il clone del brain aziendale", clone, EXIT_DEST)
+    if (clone / ".git").is_file():
+        # `.git` file (worktree o clone staccato): il path scritto dentro si controlla COM'E' SCRITTO, prima che git lo
+        # risolva (git riporta --git-common-dir gia' risolto e nasconderebbe una junction, #5)
+        try:
+            raw = (clone / ".git").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            raw = ""
+        if raw.lower().startswith("gitdir:"):
+            gd_raw = raw.split(":", 1)[1].strip()
+            _check_link_chain("il repository principale del clone (gitdir nel file .git)",
+                              Path(gd_raw) if Path(gd_raw).is_absolute() else clone / gd_raw, EXIT_DEST)
     gd = git_out(clone, "rev-parse", "--git-common-dir")
     if not gd:
         raise Stop(EXIT_CONFIG, f"{clone} non e' un repository git (clona il brain aziendale e usa inizializza_clone.py)")
     git_dir = Path(gd) if Path(gd).is_absolute() else (clone / gd)
     git_dir = Path(os.path.normpath(str(git_dir)))
     _check_link_base("la cartella .git del clone", git_dir, EXIT_DEST)
+    try:
+        git_dir.relative_to(clone)
+    except ValueError:
+        _check_link_base("il repository principale del clone (git-common-dir)", git_dir.parent, EXIT_DEST)
+        _check_link_inside("il repository principale del clone", git_dir.parent, git_dir, EXIT_DEST)
+        _check_link_chain("il repository principale del clone", git_dir.parent, EXIT_DEST)
     if (clone / ".git").exists():
         _check_link_inside("il clone", clone, clone / ".git", EXIT_DEST)
     for rel in (ZONE, kc.TRAVASO_WORKSPACE, "decisioni"):
@@ -369,7 +394,8 @@ def gh_login_strict(ctx: Ctx) -> str:
     return r.stdout.strip()
 
 def fetch_or_defer(ctx: Ctx) -> None:
-    """UN solo fetch per corsa (par. 14.9): `base_sha` resta fissato e si ricontrolla prima di ogni mutazione."""
+    """UN solo fetch per corsa (par. 14.9): `base_sha` resta fissato e si ricontrolla prima di ogni mutazione.
+    In dry-run NESSUN fetch (#12): si usa `origin/main` locale e lo si dice."""
     if QUIET:
         import contextlib
         import io
@@ -377,13 +403,18 @@ def fetch_or_defer(ctx: Ctx) -> None:
             bs.check_rewrites(ctx.run, ctx.owner, ctx.repo)
     else:
         bs.check_rewrites(ctx.run, ctx.owner, ctx.repo)
+    if ctx.dry:
+        if not ctx.run.has_ref("refs/remotes/origin/main"):
+            raise Stop(EXIT_DEFERRED, "dry-run: origin/main locale assente, serve un fetch (rilancia senza --dry-run-git)")
+        print("[dry-run-git] dry: base locale non aggiornata (nessun fetch)")
+        ctx.base_sha = git_out(ctx.clone, "rev-parse", "refs/remotes/origin/main")
+        return
     f = ctx.run.git("fetch", "origin", "--quiet", "--prune")
     if f.returncode != 0:
         raise Stop(EXIT_DEFERRED, f"travaso rinviato: `git fetch origin` fallito (offline?): {_out(f.stderr.strip(), 120)}")
     if not ctx.run.has_ref("refs/remotes/origin/main"):
         raise Stop(EXIT_DEST, "origin/main assente: il primo push del brain aziendale lo fa `github_org.py apply`")
     ctx.base_sha = git_out(ctx.clone, "rev-parse", "refs/remotes/origin/main")
-
 
 def assert_base(ctx: Ctx) -> None:
     """Prima di ogni mutazione: origin/main deve essere ancora la base fissata all'inizio della corsa (par. 14.9)."""
@@ -1142,12 +1173,12 @@ def package_dir(from_root: Path, owner: str, repo: str, review_id: str) -> Path:
     return Path(from_root) / kc.TRAVASO_WORKSPACE / f"{owner}-{repo}" / review_id
 
 
-def package_digest(files: dict, base_sha: str, persona: str, brain: str) -> tuple[str, str]:
-    """(sha256 intero, review_id = primi 16 esadecimali) del pacchetto: file, base, persona, brain (par. 14.1, #1)."""
-    core = json.dumps({"files": files, "base_sha": base_sha, "persona": persona, "brain": brain}, sort_keys=True, ensure_ascii=False)
+def package_digest(files: dict, base_sha: str, persona: str, brain: str, owner: str = "", repo: str = "") -> tuple[str, str]:
+    """(sha256 intero, review_id = primi 16 esadecimali) del pacchetto: file, base, persona, brain e DESTINAZIONE (N7)."""
+    core = json.dumps({"files": files, "base_sha": base_sha, "persona": persona, "brain": brain, "owner": owner, "repo": repo},
+                      sort_keys=True, ensure_ascii=False)
     full = sha256_bytes(core.encode("utf-8"))
     return full, full[:16]
-
 
 def build_package(ctx: Ctx, src: Source, canon: Canon, items: dict[str, SourceFile], checks: dict[str, tuple]) -> tuple[str, dict, str]:
     """(review_id, verifica.json, verifica.md): per ogni file cambiato testo nuovo (mascherato, <= 8 KB), fatti, incongruenze
@@ -1174,7 +1205,7 @@ def build_package(ctx: Ctx, src: Source, canon: Canon, items: dict[str, SourceFi
             size = len(json.dumps(entry, ensure_ascii=False))
         total += size
         files[rel] = entry
-    full_sha, review_id = package_digest(files, ctx.base_sha, ctx.persona, src.brain_id)
+    full_sha, review_id = package_digest(files, ctx.base_sha, ctx.persona, src.brain_id, ctx.owner, ctx.repo)
     pkg = {"review_id": review_id, "sha256": full_sha, "versione": TRAVASO_VERSION, "quando": now_iso(), "owner": ctx.owner,
            "repo": ctx.repo, "persona": ctx.persona, "brain": src.brain_id, "base_sha": ctx.base_sha, "policy": ctx.policy(),
            "files": files,
@@ -1207,18 +1238,20 @@ def build_package(ctx: Ctx, src: Source, canon: Canon, items: dict[str, SourceFi
 
 def write_package(from_root: Path, ctx: Ctx, review_id: str, pkg: dict, md: str) -> Path:
     d = package_dir(from_root, ctx.owner, ctx.repo, review_id)
-    _check_link_inside("workspace/travaso", from_root, d.parent, EXIT_CONFIG)
-    if d.exists():
-        _check_link_inside("workspace/travaso", from_root, d, EXIT_CONFIG)
+    for f in (d / "verifica.json", d / "verifica.md"):
+        _check_link_inside("workspace/travaso", from_root, f, EXIT_CONFIG)       # catena completa fino al file (#5)
     kc.write_text(d / "verifica.json", mask(json.dumps(pkg, ensure_ascii=False, indent=1)) + "\n")
     kc.write_text(d / "verifica.md", mask(md))
     return d
 
-def load_verdict(from_root: Path, ctx: Ctx, review_id: str) -> tuple[dict, dict, str]:
+def load_verdict(from_root: Path, ctx: Ctx, review_id: str, brain: str = "") -> tuple[dict, dict, str]:
     """(verifica.json, verdetto.json, problema). `problema` vuoto = verdetto utilizzabile; altrimenti il motivo per cui NESSUN
-    file e' verificato: digest del pacchetto diverso (manomesso o incompleto), base cambiata (par. 14.1, #1)."""
+    file e' verificato: digest diverso, identita' diversa (persona, brain, destinazione: N7), base cambiata (#1).
+    Prima di leggere: nessun link lungo la catena fino ai file (#5)."""
     d = package_dir(from_root, ctx.owner, ctx.repo, review_id)
     vj, vd = d / "verifica.json", d / "verdetto.json"
+    _check_link_inside("workspace/travaso", from_root, vj, EXIT_CONFIG)
+    _check_link_inside("workspace/travaso", from_root, vd, EXIT_CONFIG)
     if not vj.is_file():
         raise Stop(EXIT_CONFIG, f"--verdetto {review_id}: pacchetto {vj} assente (rilancia send senza --verdetto)")
     if not vd.is_file():
@@ -1236,9 +1269,14 @@ def load_verdict(from_root: Path, ctx: Ctx, review_id: str) -> tuple[dict, dict,
     for rel, v in files.items():
         if not isinstance(v, dict) or str(v.get("esito")) not in ("coerente", "incongruente", "non-verificabile"):
             raise Stop(EXIT_CONFIG, f"--verdetto {review_id}: esito non valido per `{rel}` (coerente | incongruente | non-verificabile)")
-    full, rid = package_digest(pkg.get("files") or {}, str(pkg.get("base_sha") or ""), str(pkg.get("persona") or ""), str(pkg.get("brain") or ""))
+    full, rid = package_digest(pkg.get("files") or {}, str(pkg.get("base_sha") or ""), str(pkg.get("persona") or ""),
+                               str(pkg.get("brain") or ""), str(pkg.get("owner") or ""), str(pkg.get("repo") or ""))
     if rid != review_id or str(pkg.get("sha256") or "") != full:
         return pkg, ver, "digest del pacchetto diverso da quello ricostruito (pacchetto manomesso o incompleto)"
+    ident = (str(pkg.get("persona") or ""), str(pkg.get("brain") or ""), str(pkg.get("owner") or "").lower(), str(pkg.get("repo") or "").lower())
+    if ident != (ctx.persona, brain, ctx.owner.lower(), ctx.repo.lower()):
+        return pkg, ver, (f"identita' del pacchetto diversa dalla corsa (pacchetto: {ident[0]}/{ident[1]} -> {ident[2]}/{ident[3]}; "
+                          f"corsa: {ctx.persona}/{brain} -> {ctx.full})")
     if str(pkg.get("base_sha") or "") != ctx.base_sha:
         return pkg, ver, f"base cambiata (pacchetto su origin/main {str(pkg.get('base_sha'))[:7]}, ora {ctx.base_sha[:7]})"
     return pkg, ver, ""
@@ -1313,8 +1351,8 @@ class Tx:
             self.release_lock(ref)
 
     def acquire_lock(self, issue: int, payload: dict) -> bool:
-        """Lock atomico `refs/travaso-lock/<issue>` -> blob (par. 14.8). Occupato = si salta; stantio = recupero SICURO:
-        si cancella solo se il ref punta ancora allo stesso blob letto, poi si rilegge e si procede solo se punta al PROPRIO."""
+        """Lock atomico `refs/travaso-lock/<issue>` -> blob (par. 14.8, fatto 40). Occupato e fresco = si salta; occupato e
+        STANTIO = stop esplicito (nessun takeover automatico: lo sblocca una persona con `decisioni --sblocca <n>`, #8)."""
         ref = LOCK_REF.format(issue=issue)
         ctx = self.ctx
         if ctx.dry:
@@ -1327,26 +1365,33 @@ class Tx:
             return True
         cur_sha, data = self._read_lock(ref)
         if not cur_sha:
-            return self._post_ref(ref, mine) and self.locks.setdefault(ref, mine) == mine
+            if self._post_ref(ref, mine):
+                self.locks[ref] = mine
+                return True
+            return False
         age = time.time() - float(data.get("ts", time.time()))
         if age <= LOCK_STALE_SEC:
             return False
-        fault("dopo-lettura-lock", str(issue))
-        again, _d2 = self._read_lock(ref)
-        if again != cur_sha:
-            return False                                  # qualcun altro l'ha gia' rinnovato: non si tocca
-        r = ctx.gh("api", "-X", "DELETE", f"repos/{ctx.full}/git/refs/{ref[5:]}", write=True)
-        if r is None or r.returncode != 0:
-            return False
-        if not self._post_ref(ref, mine):
-            return False
-        now_sha, _d3 = self._read_lock(ref)
-        if now_sha != mine:
-            return False                                  # perso la corsa dopo il POST: non e' nostro
-        self.locks[ref] = mine
-        issue_comment(ctx, issue, f"travaso-stato: ripresa (lock scaduto dopo {int(age // 60)} min, runner precedente "
-                                  f"`{data.get('runner', '?')}`)")
-        return True
+        ts = dt.datetime.fromtimestamp(float(data.get("ts", 0))).strftime("%Y-%m-%d %H:%M:%S") if data.get("ts") else "?"
+        raise Stop(EXIT_STOP, f"lock stantio su issue #{issue} (runner `{data.get('runner', '?')}`, ts {ts}, {int(age // 60)} min): "
+                              f"se il processo e' morto, `decisioni --sblocca {issue}`")
+
+    def sblocca(self, issue: int) -> str:
+        """`--sblocca <n>`: cancellazione ESPLICITA del lock dopo averlo riletto; commento sulla issue (#8)."""
+        ref = LOCK_REF.format(issue=issue)
+        ctx = self.ctx
+        cur_sha, data = self._read_lock(ref)
+        if not cur_sha:
+            return f"#{issue}: nessun lock da sbloccare"
+        if ctx.dry:
+            return f"[dry-run-git] #{issue}: lock di `{data.get('runner', '?')}` NON rimosso"
+        ctx.gh_api_write("DELETE", f"repos/{ctx.full}/git/refs/{ref[5:]}")
+        again, _d = self._read_lock(ref)
+        if again:
+            raise Stop(EXIT_DEST, f"--sblocca {issue}: il lock e' ancora presente dopo la cancellazione (ricreato da un'altra corsa?)")
+        issue_comment(ctx, issue, f"travaso-stato: lock sbloccato a mano da @{ctx.login} (era di `{data.get('runner', '?')}`, "
+                                  f"ts {data.get('ts', '?')}): l'applicazione riparte da questa corsa.")
+        return f"#{issue}: lock di `{data.get('runner', '?')}` sbloccato da @{ctx.login}"
 
     def _post_ref(self, ref: str, sha: str) -> bool:
         r = self.ctx.gh("api", "-X", "POST", f"repos/{self.ctx.full}/git/refs", "--input", "-", write=True,
@@ -1371,15 +1416,21 @@ class Tx:
         return sha, data if isinstance(data, dict) else {}
 
     def release_lock(self, ref: str) -> None:
+        """Rilascio SOLO del proprio lock: rilettura, poi DELETE (la finestra fra rilettura e DELETE non ha CAS su GitHub:
+        dichiarata nel README). DELETE in errore = exit 9 (#24)."""
         mine = self.locks.pop(ref, None)
         if self.ctx.dry or mine is None:
             return
         cur, _d = self._read_lock(ref)
-        if cur == mine:                                   # si rilascia SOLO il proprio lock (par. 14.8)
-            self.ctx.gh("api", "-X", "DELETE", f"repos/{self.ctx.full}/git/refs/{ref[5:]}", write=True)
+        if cur == mine:
+            r = self.ctx.gh("api", "-X", "DELETE", f"repos/{self.ctx.full}/git/refs/{ref[5:]}", write=True)
+            if r is None or r.returncode != 0:
+                raise Stop(EXIT_DEST, f"rilascio del lock {ref} fallito: {_out((r.stderr if r else '') or 'gh assente', 160)} "
+                                      "(se resta, una persona lo toglie con `decisioni --sblocca`)")
 
 # ---------------------------------------------------------------------------- branch, PR, status, issue (par. 6, 14.7, 14.9, 14.10)
 PR_FIELDS = "number,state,url,headRefOid,headRefName,labels,autoMergeRequest,title,body"
+CLOSED_MARK = "<!-- travaso-chiusa:"      # nel corpo di una PR chiusa DAL TRAVASO (diff vuoto): non e' un "no" di una persona
 
 
 def pr_for_branch(ctx: Ctx, branch: str) -> dict | None:
@@ -1406,7 +1457,8 @@ def prepare_branch(ctx: Ctx, tx: Tx, branch: str, stop_if_closed: bool) -> tuple
     remote = f"refs/remotes/origin/{branch}"
     state = str((pr or {}).get("state") or "").upper()
     if pr and state == "CLOSED":
-        if stop_if_closed:
+        if stop_if_closed and CLOSED_MARK not in str(pr.get("body") or ""):
+            # chiusa da una persona = "no" (par. 14.10); chiusa dal travaso perche' il diff era vuoto = si riparte da main
             raise Stop(EXIT_STOP, f"la PR del branch {branch} e' CHIUSA senza merge ({pr.get('url', '')}): nessun travaso. "
                                   f"Riaprila oppure cancella il branch remoto (git push origin --delete {branch}) e rilancia")
         pr = None
@@ -1510,13 +1562,15 @@ def outgoing_or_refuse(ctx: Ctx, wt: Path) -> tuple[int, str]:
 
 
 def push_branch(ctx: Ctx, wt: Path, branch: str) -> None:
-    """Prima del push: base ancora quella fissata; ref locale di sicurezza `refs/travaso-local/<persona>/<ts>` (par. 14.9,
-    #10). Poi push all'URL canonico; il branch locale sopravvive al worktree."""
+    """Prima del push: base ancora quella fissata; ref locale di sicurezza `refs/travaso-local/<persona>/<ts>` (errore =
+    stop, #10). Poi push all'URL canonico; il branch locale sopravvive al worktree."""
     assert_base(ctx)
     head = git_out(wt, "rev-parse", "HEAD")
     if not ctx.dry:
         safe = f"refs/travaso-local/{ctx.persona or 'clone'}/{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{head[:7]}"
-        git(ctx.clone, "update-ref", safe, head)
+        r = git(ctx.clone, "update-ref", safe, head)
+        if r.returncode != 0:
+            raise Stop(EXIT_STOP, f"ref locale di sicurezza non scrivibile ({safe}): {git_err(r)}; nessun push")
     run = bs.Runner(wt, ctx.dry)
     if QUIET:
         import contextlib
@@ -1528,7 +1582,9 @@ def push_branch(ctx: Ctx, wt: Path, branch: str) -> None:
     if p.returncode != 0:
         raise Stop(EXIT_STOP, f"push di {branch} fallito: {_out(p.stderr.strip(), 200)} (copia locale in refs/travaso-local/)")
     if not ctx.dry:
-        git(ctx.clone, "branch", "-f", branch, head)
+        r = git(ctx.clone, "branch", "-f", branch, head)
+        if r.returncode != 0:
+            raise Stop(EXIT_STOP, f"branch locale {branch} non aggiornato: {git_err(r)}")
 
 def pr_create(ctx: Ctx, branch: str, title: str, body: str, labels: list[str]) -> dict:
     args = ["pr", "create", "--repo", ctx.full, "--base", "main", "--head", branch, "--title", mask(title), "--body-file", "-"]
@@ -1557,11 +1613,31 @@ def _gh_write(ctx: Ctx, what: str, *args: str, input_text: str | None = None) ->
 
 
 def pr_edit_body(ctx: Ctx, number: int, body: str) -> None:
-    _gh_write(ctx, f"aggiornamento del corpo della PR #{number}", "pr", "edit", str(number), "--repo", ctx.full, "--body-file", "-",
-              input_text=mask(body))
+    """SOLO REST (fatto live, gh 2.70.0: `gh pr edit` fallisce sempre per il campo deprecato projectCards)."""
+    if ctx.dry:
+        print(f"[dry-run-git] corpo della PR #{number} aggiornato")
+        return
+    ctx.gh_api_write("PATCH", f"repos/{ctx.full}/pulls/{number}", {"body": mask(body)})
+
 
 def pr_close(ctx: Ctx, number: int, comment: str) -> None:
-    _gh_write(ctx, f"chiusura della PR #{number}", "pr", "close", str(number), "--repo", ctx.full, "--delete-branch", "--comment", mask(comment))
+    """Commento, chiusura e cancellazione del branch: SOLO REST (mai `gh pr close`)."""
+    if ctx.dry:
+        print(f"[dry-run-git] PR #{number} chiusa: {_out(comment, 80)}")
+        return
+    view = ctx.gh_json("pr", "view", str(number), "--repo", ctx.full, "--json", "headRefName,state,body")
+    body = str((view or {}).get("body") or "").rstrip("\n")
+    ctx.gh_api_write("POST", f"repos/{ctx.full}/issues/{number}/comments", {"body": mask(comment)})
+    ctx.gh_api_write("PATCH", f"repos/{ctx.full}/pulls/{number}",
+                     {"state": "closed", "body": f"{body}\n\n{CLOSED_MARK} {_out(comment, 120)} -->\n"})
+    branch = str((view or {}).get("headRefName") or "")
+    if branch:
+        r = ctx.gh("api", "-X", "DELETE", f"repos/{ctx.full}/git/refs/heads/{branch}", write=True)
+        if r is None:
+            raise Stop(EXIT_DEFERRED, "travaso rinviato: gh assente")
+        err = ((r.stderr or "") + (r.stdout or "")).lower()
+        if r.returncode != 0 and "does not exist" not in err and "404" not in err:
+            raise Stop(EXIT_DEST, f"cancellazione del branch {branch} dopo la chiusura della PR #{number} fallita: {_out(err.strip(), 160)}")
 
 def post_status(ctx: Ctx, sha: str, state: str, description: str) -> None:
     desc = _out(description, STATUS_MAX)
@@ -1589,27 +1665,46 @@ def ensure_labels(ctx: Ctx, names: list[str]) -> None:
         if n.lower() not in known:
             r = ctx.gh("api", "-X", "POST", f"repos/{ctx.full}/labels", "--input", "-", write=True,
                        input_text=json.dumps({"name": n, "color": "ededed"}))
-            if r is not None and r.returncode == 0:
-                known.add(n.lower())
-
+            if r is None or r.returncode != 0:          # #24: mai in silenzio
+                raise Stop(EXIT_DEST, f"creazione della label `{n}` fallita: {_out((r.stderr if r else '') or 'gh assente', 160)} "
+                                      "(le label le crea `github_org.py apply`; serve il permesso triage/push)")
+            known.add(n.lower())
 
 def issue_comment(ctx: Ctx, number: int, body: str) -> None:
     if ctx.dry:
         print(f"[dry-run-git] commento sulla issue #{number}: {_out(body, 80)}")
         return
-    _gh_write(ctx, f"commento sulla issue #{number}", "issue", "comment", str(number), "--repo", ctx.full, "--body-file", "-", input_text=mask(body))
+    ctx.gh_api_write("POST", f"repos/{ctx.full}/issues/{number}/comments", {"body": mask(body)})
+
+
+def issue_edit_body(ctx: Ctx, number: int, body: str) -> None:
+    """SOLO REST (mai `gh issue edit`)."""
+    if ctx.dry:
+        return
+    ctx.gh_api_write("PATCH", f"repos/{ctx.full}/issues/{number}", {"body": mask(body)})
+
+
+def issue_close(ctx: Ctx, number: int) -> None:
+    """SOLO REST (mai `gh issue close`)."""
+    if ctx.dry:
+        print(f"[dry-run-git] issue #{number} chiusa")
+        return
+    ctx.gh_api_write("PATCH", f"repos/{ctx.full}/issues/{number}", {"state": "closed"})
 
 
 def issue_labels(ctx: Ctx, number: int, add: list[str] = (), remove: list[str] = ()) -> None:
+    """Label via REST: POST per aggiungere, DELETE per togliere (label assente sulla issue = 404, ignorato)."""
     if ctx.dry:
         return
-    args = ["issue", "edit", str(number), "--repo", ctx.full]
-    for lb in add:
-        args += ["--add-label", lb]
+    if add:
+        ctx.gh_api_write("POST", f"repos/{ctx.full}/issues/{number}/labels", {"labels": list(add)})
     for lb in remove:
-        args += ["--remove-label", lb]
-    if len(args) > 5:
-        _gh_write(ctx, f"label della issue #{number}", *args)
+        r = ctx.gh("api", "-X", "DELETE", f"repos/{ctx.full}/issues/{number}/labels/{quote(lb, safe='')}", write=True)
+        if r is None:
+            raise Stop(EXIT_DEFERRED, "travaso rinviato: gh assente")
+        err = ((r.stderr or "") + (r.stdout or "")).lower()
+        if r.returncode != 0 and "404" not in err and "does not exist" not in err and "not found" not in err:
+            raise Stop(EXIT_DEST, f"rimozione della label `{lb}` dalla issue #{number} fallita: {_out(err.strip(), 160)}")
 
 MACHINE_RE = re.compile(r"<!--\s*travaso:\s*(\{.*?\})\s*-->", re.S)
 VERSION_RE = re.compile(r"<!--\s*travaso-versione:\s*(\d+)\s*-->")
@@ -1688,8 +1783,7 @@ def issue_title(ctx: Ctx, f: Fermo) -> str:
         i = f.incongruenze[0]
         extra = f" (+{len(f.incongruenze) - 1})" if len(f.incongruenze) > 1 else ""
         return f"Da decidere: {i.soggetto.split('/', 1)[-1]} — {i.chiave}{extra}"
-    return f"Da decidere: {PurePosixPath(f.src_rel).stem} — {f.motivo[:50] or 'verifica manuale'}"
-
+    return f"Da decidere: {PurePosixPath(f.src_rel).stem} — {_out(f.motivo, 50) or 'verifica manuale'}"   # maschera POI tronca (#13)
 
 def issue_body(ctx: Ctx, f: Fermo, versione: int, persona: str, brain: str, pr_url: str) -> tuple[str, dict]:
     areas, resp_p, resp_login = _areas_for(ctx, f)
@@ -1731,7 +1825,7 @@ def _fatti_key(fatti: list) -> list[tuple]:
 def upsert_issues(ctx: Ctx, fermi: list[Fermo], persona: str, brain: str, pr_url: str) -> None:
     """Una issue per file fermo (riusata se aperta per lo stesso `dest`). La proposta e' versionata: la issue resta valida
     tale e quale SOLO se coincidono hash del file, fatti (chiavi e valori nuovo/canon), base e head (#7); altrimenti body
-    rigenerato con caselle vuote, versione+1, commento "aggiornata: ricontrolla"."""
+    rigenerato con caselle vuote, versione+1, `in-applicazione` tolto e stato azzerato ("proposta rinnovata vN", N3)."""
     if not fermi:
         return
     existing = list_issues(ctx, [LABEL_DA_DECIDERE, f"persona/{persona}"])
@@ -1760,11 +1854,11 @@ def upsert_issues(ctx: Ctx, fermi: list[Fermo], persona: str, brain: str, pr_url
             if ctx.dry:
                 print(f"[dry-run-git] issue #{f.issue} aggiornata (versione {versione})")
                 continue
-            _gh_write(ctx, f"corpo della issue #{f.issue}", "issue", "edit", str(f.issue), "--repo", ctx.full, "--body-file", "-", input_text=mask(body))
-            issue_labels(ctx, f.issue, add=[f"area/{a}" for a in f.areas])
+            issue_edit_body(ctx, f.issue, body)                # REST (fatto live: niente `gh issue edit`)
+            issue_labels(ctx, f.issue, add=[f"area/{a}" for a in f.areas], remove=[LABEL_IN_APPLICAZIONE] if LABEL_IN_APPLICAZIONE in _labels(iss) else [])
             issue_comment(ctx, f.issue, f"<!-- travaso: {json.dumps(machine, ensure_ascii=False)} -->")
-            issue_comment(ctx, f.issue, f"aggiornata il {kc.logical_today().isoformat()}: proposta cambiata (file, fatti, base o head), versione {versione}: "
-                                        "ricontrolla e rispunta la casella.")
+            issue_comment(ctx, f.issue, f"travaso-stato: proposta rinnovata v{versione}: issue aggiornata il {kc.logical_today().isoformat()} "
+                                        "perche' la proposta e' cambiata (file, fatti, base o head); stato azzerato, ricontrolla e rispunta la casella.")
             continue
         body, machine = issue_body(ctx, f, 1, persona, brain, pr_url)
         if ctx.dry:
@@ -1819,7 +1913,8 @@ class Esito:
             return
         self.data["exit"] = code
         try:
-            _check_link_inside("workspace/travaso", self.from_root, d, EXIT_CONFIG)
+            for f in (d / f"{self.ts}.json", d / f"{self.ts}.md"):
+                _check_link_inside("workspace/travaso", self.from_root, f, EXIT_CONFIG)   # catena fino al file (#5)
             kc.write_text(d / f"{self.ts}.json", mask(json.dumps(self.data, ensure_ascii=False, indent=1)) + "\n")
             kc.write_text(d / f"{self.ts}.md", mask(self.markdown(code)))
         except (OSError, Stop) as e:
@@ -1897,14 +1992,18 @@ def ingest_env(clone: Path, base_env: dict | None = None) -> dict:
     return env
 
 
-def post_merge_chores(ctx: Ctx) -> list[str]:
-    """Dopo send/decisioni (par. 14.17): fast-forward del main del clone se e' su main e pulito; ingest della zona travaso
-    SOLO con clone allineato a origin/main e con la collection del clone (N1)."""
+def post_merge_chores(ctx: Ctx, merged: bool = False) -> list[str]:
+    """Dopo send/decisioni (par. 14.17): se c'e' stato un merge immediato, fetch PRIMA; fast-forward del main del clone se e'
+    su main e PULITO (anche gli untracked, #17); ingest della zona travaso SOLO con clone allineato a origin/main e con la
+    collection del clone (N1)."""
     notes: list[str] = []
     if ctx.dry:
         return notes
+    if merged:
+        f = ctx.run.git("fetch", "origin", "--quiet", "--prune")
+        notes.append("fetch dopo il merge immediato" + ("" if f.returncode == 0 else " FALLITO"))
     branch = ctx.run.current_branch()
-    dirty = bool(git_out(ctx.clone, "status", "--porcelain", "--untracked-files=no"))
+    dirty = bool(git_out(ctx.clone, "status", "--porcelain", "--untracked-files=all"))
     aligned = False
     if branch == "main" and not dirty:
         if git_ok(ctx.clone, "merge", "--ff-only", "-q", "refs/remotes/origin/main"):
@@ -1913,12 +2012,12 @@ def post_merge_chores(ctx: Ctx) -> list[str]:
         else:
             notes.append("main del clone NON avanza in fast-forward: riallinea a mano")
     else:
-        notes.append(f"clone su `{branch or 'HEAD staccato'}`{' con modifiche' if dirty else ''}: main non aggiornato")
+        notes.append(f"clone su `{branch or 'HEAD staccato'}`{' con modifiche o file non tracciati' if dirty else ''}: main non aggiornato")
     if ctx.no_ingest:
         notes.append("ingest aziendale saltato (--no-ingest)")
         return notes
     if not aligned:
-        notes.append("ingest aziendale saltato: clone non allineato (serve main pulito e uguale a origin/main)")
+        notes.append("ingest aziendale saltato: clone non allineato (serve main pulito, senza file non tracciati, uguale a origin/main)")
         return notes
     env = ingest_env(ctx.clone)
     clone_env = kc._parse_env_file(ctx.clone / ".env") if (ctx.clone / ".env").is_file() else {}
@@ -1997,8 +2096,10 @@ def attesa_status_and_issues(ctx: Ctx, tx: Tx, persona: str, brain: str, fermi: 
     nums = sorted(set(nums) | {f.issue for f in fermi if f.issue})
     body_lines += [f"## File ({len(in_attesa)})"] + [f"- `{p}`" + (f" → #{next((f.issue for f in fermi if f.dest == p and f.issue), '')}") for p in in_attesa]
     body_lines += ["", "## Issue"] + [f"- #{n}" for n in nums]
-    if created or staged_changed:
-        pr_edit_body(ctx, int(pr["number"]), "\n".join(body_lines) + "\n")
+    fault("dopo-pr-attesa", str(pr.get("number") or 0))
+    new_body = "\n".join(body_lines) + "\n"
+    if created or staged_changed or (pr.get("body") or "") != new_body:       # ripresa idempotente: corpo mancante o vecchio
+        pr_edit_body(ctx, int(pr["number"]), new_body)
     n_facts = sum(len(f.incongruenze) for f in fermi)
     desc = status_description(False, len(in_attesa), nums, n_facts, "non verificata (file fermi)", ctx.base_sha)
     if head and (staged_changed or created or not _has_status(ctx, head)):
@@ -2123,6 +2224,11 @@ def _sources_block(body: str) -> dict:
         return {}
 
 
+def _tree_hash(wt: Path, prefix: str) -> str:
+    """Impronta del contenuto di una sorgente sul branch (ls-tree di HEAD nel worktree): record `travaso-sorgenti` (N4)."""
+    return sha256_bytes(git_out(wt, "ls-tree", "-r", "HEAD", "--", prefix).encode("utf-8"))
+
+
 def _sources_in(paths: list[str]) -> list[str]:
     out: list[str] = []
     for p in paths:
@@ -2135,8 +2241,9 @@ def _sources_in(paths: list[str]) -> list[str]:
 
 
 def _withdraw_for_verification(ctx: Ctx, tx: Tx, persona: str, prefix: str, rels: list[str], brain: str) -> str:
-    """#10: prima di uscire con 13, la PR auto aperta non deve piu' contenere versioni OBSOLETE dei file da verificare: si
-    riportano alla versione di main (o si tolgono), commit + push, status failure; diff vuoto = PR chiusa."""
+    """#10: prima di uscire con 13 la PR auto aperta non deve contenere NESSUNO stato obsoleto di questa sorgente (file da
+    verificare, diventati fermi, esclusi, cancellati, cambiati): il sottoalbero della sorgente torna a `main`, commit + push,
+    status failure; diff vuoto = PR chiusa."""
     branch = BRANCH_AUTO.format(persona=persona)
     pr = pr_for_branch(ctx, branch)
     if not pr or str(pr.get("state")).upper() != "OPEN" or not ctx.run.has_ref(f"refs/remotes/origin/{branch}"):
@@ -2144,27 +2251,19 @@ def _withdraw_for_verification(ctx: Ctx, tx: Tx, persona: str, prefix: str, rels
     _base, pr, merged = prepare_branch(ctx, tx, branch, stop_if_closed=False)
     wt = tx.worktree
     assert wt is not None
-    touched = []
-    for rel in rels:
-        p = prefix + rel
-        in_branch = git_ok(wt, "cat-file", "-e", f"HEAD:{p}")
-        in_main = git_ok(wt, "cat-file", "-e", f"refs/remotes/origin/main:{p}")
-        if in_main:
-            if git_out(wt, "rev-parse", f"HEAD:{p}") != git_out(wt, "rev-parse", f"refs/remotes/origin/main:{p}"):
-                git(wt, "checkout", "-q", "refs/remotes/origin/main", "--", p)
-                touched.append(p)
-        elif in_branch:
-            git(wt, "rm", "-q", "--", p)
-            touched.append(p)
-    if not touched and not merged:
-        return ""
+    before = [x for x in git_out(wt, "diff", "--name-only", "refs/remotes/origin/main", "HEAD", "--", prefix).splitlines() if x.strip()]
+    restore_from_main(wt, prefix)
+    touched = before
     stage_and_verify(wt, [prefix], {})
+    staged = git(wt, "diff", "--cached", "--quiet").returncode != 0
+    if not staged and not merged:
+        return ""
     diff_all = [x for x in git_out(wt, "diff", "--cached", "--name-only", "refs/remotes/origin/main").splitlines() if x.strip()]
-    if touched:
-        commit_in(wt, f"travaso {persona} {kc.logical_today().isoformat()}: ritiro di {len(touched)} file in attesa di verifica ({brain})\n\n"
+    if staged:
+        commit_in(wt, f"travaso {persona} {kc.logical_today().isoformat()}: ritiro di {len(touched)} file di {brain} in attesa di verifica\n\n"
                       f"Travaso-Persona: {persona}\nTravaso-Brain: {brain}\nTravaso-Versione: {TRAVASO_VERSION}\n", ctx.dry, ctx)
     if not diff_all:
-        if touched:
+        if staged:
             push_branch(ctx, wt, branch)
         pr_close(ctx, int(pr["number"]), "ritirati i file in attesa di verifica: nulla da integrare.")
         return f"PR #{pr['number']} chiusa (ritirati {len(touched)} file)"
@@ -2173,7 +2272,6 @@ def _withdraw_for_verification(ctx: Ctx, tx: Tx, persona: str, prefix: str, rels
     head = git_out(wt, "rev-parse", "HEAD")
     post_status(ctx, head, "failure", f"da verificare: {len(rels)} file ({brain}); nulla si fonde finche' manca il verdetto; base:{ctx.base_sha[:7]}")
     return f"ritirati {len(touched)} file dalla PR #{pr['number']} (status failure)"
-
 
 def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: Esito) -> int:
     prefix = f"{ZONE}/{persona}/{src.brain_id}/"
@@ -2262,7 +2360,7 @@ def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: E
     review_id = ""
     verdict_problem = ""
     if a.verdetto:
-        pkg, ver, verdict_problem = load_verdict(from_root, ctx, a.verdetto)
+        pkg, ver, verdict_problem = load_verdict(from_root, ctx, a.verdetto, src.brain_id)
         review_id = a.verdetto
         if verdict_problem:
             notes.append(f"verdetto {a.verdetto} NON utilizzabile: {verdict_problem}")
@@ -2363,17 +2461,20 @@ def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: E
             push_branch(ctx, wt, branch_auto)
             azioni += 1
         # N4: una riga per SORGENTE nel corpo della PR; lo status copre l'intero head
+        fresh = bool(a.verdetto) and not verdict_problem and bool(verified)   # N4: verifica nuova e valida in QUESTA corsa
         records = _sources_block((pr_auto or {}).get("body") or "")
-        records[prefix] = {"brain": src.brain_id, "semantica": semantica, "base_sha": ctx.base_sha,
+        records[prefix] = {"brain": src.brain_id, "semantica": semantica, "base_sha": ctx.base_sha, "review_id": review_id,
+                           "hash": _tree_hash(wt, prefix),
                            "verificata": bool(entrati) and n_ver == len(entrati) or (not entrati and not diff_main)}
         in_diff = _sources_in(diff_all)
         if policy == "richiesta":
             for pre in in_diff:
                 rec = records.get(pre) or {}
+                same_tree = not rec.get("hash") or rec.get("hash") == _tree_hash(wt, pre)
                 if pre == prefix:
                     ok_src = (n_ver == len(entrati)) if entrati else bool(rec.get("verificata")) and rec.get("base_sha") == ctx.base_sha
                 else:
-                    ok_src = bool(rec.get("verificata")) and rec.get("base_sha") == ctx.base_sha
+                    ok_src = bool(rec.get("verificata")) and rec.get("base_sha") == ctx.base_sha and same_tree
                 if not ok_src:
                     missing_sources.append(str(rec.get("brain") or pre.rstrip("/").split("/")[-1]))
         labels = [LABEL_SEMANTICA] if (entrati and policy == "facoltativa" and n_ver < len(entrati)) else []
@@ -2382,9 +2483,9 @@ def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: E
         if pr_auto is None:
             pr_auto = pr_create(ctx, branch_auto, f"travaso {persona} {kc.logical_today().isoformat()}", body, labels)
             azioni += 1
-        elif staged or merged_main:
-            pr_edit_body(ctx, int(pr_auto["number"]), body)
-        if staged or merged_main or not _has_status(ctx, head_auto):
+        elif staged or merged_main or fresh or (pr_auto.get("body") or "") != body:
+            pr_edit_body(ctx, int(pr_auto["number"]), body)   # N4: anche a byte invariati, se la verifica e' nuova
+        if staged or merged_main or fresh or not _has_status(ctx, head_auto):
             if missing_sources:
                 post_status(ctx, head_auto, "failure", f"sorgenti da verificare: {', '.join(missing_sources)}; fatti: {n_facts}; base:{ctx.base_sha[:7]}")
             else:
@@ -2397,6 +2498,8 @@ def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: E
             line1 = f"Travaso verso {ctx.full}: {len(entrati)} integrati (PR #{pr_auto['number']} fusa subito: requisiti gia' soddisfatti)"
         elif staged or merged_main:
             line1 = f"Travaso verso {ctx.full}: {len(entrati)} inviati (PR #{pr_auto['number']}, in attesa dei check)"
+        elif fresh:
+            line1 = f"Travaso verso {ctx.full}: {len(entrati)} inviati (PR #{pr_auto['number']} gia' aperta: verifica registrata, status aggiornato)"
         else:
             line1 = f"Travaso verso {ctx.full}: 0 azioni (PR #{pr_auto['number']} gia' aggiornata con {len(diff_all)} file)"
         es.data["pr_auto"] = {"number": pr_auto["number"], "url": pr_auto.get("url", ""), "sha": head_auto}
@@ -2429,7 +2532,8 @@ def _send(ctx: Ctx, tx: Tx, src: Source, from_root: Path, persona: str, a, es: E
         first = fermo_sentence(fermi_list[0], "tu")
         more = f" (+{len(fermi_list) - 1} altri)" if len(fermi_list) > 1 else ""
         lines.append(f"{len(fermi_list)} {'pezzo fermo' if len(fermi_list) == 1 else 'pezzi fermi'}: {first}{more}")
-    chores = post_merge_chores(ctx)
+    chores = post_merge_chores(ctx, merged=integrati)     # #17: dopo un merge immediato fetch + ff PRIMA dell'ingest
+    notes += chores
     tail = []
     shown = [f"{es.name(p)} ({w.split(':')[0].split('(')[0].strip() or w})" for p, w in snap.excluded[:2]]
     if snap.excluded:
@@ -2472,47 +2576,66 @@ def _version_of(issue: dict, m: dict) -> int:
     return int(v.group(1)) if v else int(m.get("versione") or 1)
 
 
-GRAPHQL_EDITS = ("query($owner:String!,$name:String!,$number:Int!,$last:Int!){repository(owner:$owner,name:$name){issue(number:$number)"
-                 "{userContentEdits(last:$last){totalCount nodes{editor{login} editedAt deletedAt diff}}}}}")
+GRAPHQL_EDITS = ("query($owner:String!,$name:String!,$number:Int!,$last:Int!,$before:String){repository(owner:$owner,name:$name)"
+                 "{issue(number:$number){userContentEdits(last:$last,before:$before){totalCount pageInfo{hasPreviousPage startCursor}"
+                 "nodes{editor{login} editedAt deletedAt diff}}}}}")
 BOX_LABELS = {"nuovo": "vale il nuovo", "canon": "vale il canon", "entrambi": "valgono entrambi"}
+EDITS_MAX_PAGES = 20
 
 
 def _box_ticked(body: str, label: str) -> bool:
     return re.search(r"^\s*[-*]\s*\[[xX]\]\s*" + re.escape(label), body or "", re.M) is not None
 
 
-def editor_of_tick(ctx: Ctx, number: int, version: int, choice: str) -> str | None:
-    """Chi ha spuntato LA casella scelta (fatto live: `userContentEdits.diff` e' la COPIA INTERA del corpo di ogni revisione,
-    la creazione e' la prima revisione, i nodi arrivano anche dal piu' recente, `totalCount` dice se servono piu' di 20).
-    Si ordinano le revisioni per editedAt, si ricostruisce lo stato della casella e si attribuisce la decisione all'editor
-    dell'ULTIMA transizione [ ] -> [x] che resta spuntata fino alla revisione finale, la quale deve portare la versione corrente."""
+def editor_of_tick(ctx: Ctx, number: int, version: int, choice: str) -> tuple[str | None, str]:
+    """(editor, motivo). Chi ha spuntato LA casella scelta. Fatto 41: `userContentEdits.diff` e' il corpo INTERO della
+    revisione, la creazione e' la prima revisione, l'ordine va ricostruito da `editedAt`, `totalCount` oltre la finestra
+    richiede la paginazione (cursore `before`). Si pagina all'indietro finche' si trova la transizione [ ] -> [x] della
+    casella (editor = quella revisione) o si raggiunge la creazione (stato iniziale = corpo della creazione, mai "casella
+    vuota" per ipotesi). Una revisione eliminata (`deletedAt`) nella finestra rilevante, o una storia che non si riesce a
+    completare = non dimostrabile (#7, #23)."""
     label = BOX_LABELS[choice]
-    nodes: list[dict] = []
-    last = 20
-    for _attempt in range(4):
-        data = ctx.gh_json("api", "graphql", "-f", f"query={GRAPHQL_EDITS}", "-F", f"owner={ctx.owner}", "-F", f"name={ctx.repo}",
-                           "-F", f"number={number}", "-F", f"last={last}")
+    revs: list[dict] = []
+    before: str | None = None
+    reached_start = False
+    for _page in range(EDITS_MAX_PAGES):
+        args = ["api", "graphql", "-f", f"query={GRAPHQL_EDITS}", "-F", f"owner={ctx.owner}", "-F", f"name={ctx.repo}",
+                "-F", f"number={number}", "-F", "last=20"]
+        if before:
+            args += ["-f", f"before={before}"]
+        try:
+            data = ctx.gh_json(*args)
+        except Stop as e:
+            return None, f"storia delle modifiche incompleta (pagina non leggibile: {_out(e.msg, 120)})"
         uce = ((((data or {}).get("data") or {}).get("repository") or {}).get("issue") or {}).get("userContentEdits") or {}
-        nodes = [n for n in (uce.get("nodes") or []) if isinstance(n, dict) and not n.get("deletedAt")]
-        total = int(uce.get("totalCount") or len(nodes))
-        if total <= len(nodes) or last >= 100:
+        page = [n for n in (uce.get("nodes") or []) if isinstance(n, dict)]
+        if not page and not revs:
+            return None, "storia delle modifiche vuota"
+        revs = page + revs if before else list(page)
+        info = uce.get("pageInfo") or {}
+        revs.sort(key=lambda n: str(n.get("editedAt") or ""))
+        final = revs[-1]
+        if final.get("deletedAt"):
+            return None, "storia delle modifiche incompleta (ultima revisione eliminata)"
+        vm = VERSION_RE.search(str(final.get("diff") or ""))
+        if not vm or int(vm.group(1)) != version or not _box_ticked(str(final.get("diff") or ""), label):
+            return None, "la revisione finale non porta la casella spuntata con la versione corrente"
+        # dall'ultima revisione all'indietro: la prima NON spuntata delimita la transizione
+        for i in range(len(revs) - 1, -1, -1):
+            n = revs[i]
+            if n.get("deletedAt"):
+                return None, "storia delle modifiche incompleta (revisione eliminata nella finestra rilevante)"
+            if not _box_ticked(str(n.get("diff") or ""), label):
+                return (revs[i + 1].get("editor") or {}).get("login"), "casella"
+        if not info.get("hasPreviousPage"):
+            reached_start = True
             break
-        last = min(100, total)
-    if not nodes:
-        return None
-    nodes.sort(key=lambda n: str(n.get("editedAt") or ""))
-    final = str(nodes[-1].get("diff") or "")
-    vm = VERSION_RE.search(final)
-    if not vm or int(vm.group(1)) != version or not _box_ticked(final, label):
-        return None
-    editor = None
-    prev = False
-    for n in nodes:
-        now = _box_ticked(str(n.get("diff") or ""), label)
-        if now and not prev:
-            editor = (n.get("editor") or {}).get("login")
-        prev = now
-    return editor if prev else None
+        before = str(info.get("startCursor") or "")
+        if not before:
+            break
+    if reached_start:
+        return (revs[0].get("editor") or {}).get("login"), "casella gia' spuntata alla creazione"
+    return None, "storia delle modifiche incompleta (oltre le pagine leggibili)"
 
 def read_decision(ctx: Ctx, issue: dict, m: dict) -> tuple[str, str, str, int] | None:
     """(scelta, decisore, come, versione) oppure None (con eventuale commento di avviso, una volta per versione).
@@ -2528,10 +2651,14 @@ def read_decision(ctx: Ctx, issue: dict, m: dict) -> tuple[str, str, str, int] |
         _comment_once(ctx, issue, f"due-caselle-v{v}", f"Due caselle spuntate (versione {v}): lasciane UNA sola, poi rilancio `decisioni`.")
         return None
     if len(ticked) == 1:
-        editor = editor_of_tick(ctx, int(issue["number"]), v, ticked[0])
+        editor, why = editor_of_tick(ctx, int(issue["number"]), v, ticked[0])
         if not editor:
-            _comment_once(ctx, issue, f"editor-ignoto-v{v}", "Non riesco a stabilire chi ha spuntato la casella (userContentEdits): "
-                                                           f"nessuna azione. In alternativa scrivi un commento `vale: {ticked[0]} v{v}`.")
+            if "incompleta" in why:
+                _comment_once(ctx, issue, f"storia-incompleta-v{v}", f"Storia delle modifiche incompleta ({why}): non posso attribuire "
+                                                                    f"la spunta. Ridecidi con un commento `vale: {ticked[0]} v{v}`.")
+            else:
+                _comment_once(ctx, issue, f"editor-ignoto-v{v}", f"Non riesco a stabilire chi ha spuntato la casella ({why}): "
+                                                               f"nessuna azione. In alternativa scrivi un commento `vale: {ticked[0]} v{v}`.")
             return None
         return ticked[0], editor, "casella", v
     for c in reversed(issue.get("comments") or []):
@@ -2579,12 +2706,13 @@ def _add_decision_frontmatter(text: str, entry: str) -> str:
 
 def prepare_deciso(ctx: Ctx, tx: Tx, issue: dict, m: dict, choice: str, decider: str, how: str, version: int) -> dict:
     """PR `travaso/deciso/<n>` con il registro (sempre), il file deciso (nuovo/entrambi, kind travaso) e il frontmatter della
-    nota canon superata (nuovo). Status success + auto-merge. Idempotente: PR aperta esistente = riuso (riallineata se indietro)."""
+    nota canon superata (nuovo). Status success + auto-merge. Idempotente: PR aperta esistente = riuso (riallineata e
+    rivalutata se indietro, #9)."""
     n = int(issue["number"])
     branch = BRANCH_DECISO.format(issue=n)
     existing = pr_for_branch(ctx, branch)
     if existing and str(existing.get("state")).upper() == "OPEN":
-        return _ensure_deciso_pr(ctx, tx, n, existing)
+        return _ensure_deciso_pr(ctx, tx, n, existing, issue, m)
     if tx.worktree is None:
         tx.open("refs/remotes/origin/main")
     else:
@@ -2617,8 +2745,8 @@ def prepare_deciso(ctx: Ctx, tx: Tx, issue: dict, m: dict, choice: str, decider:
             files[nota] = _add_decision_frontmatter(text, entry).encode("utf-8")
             note_edits.append(nota)
     reg = {"issue": n, "kind": m.get("kind"), "persona": persona, "path": m.get("path"), "dest": dest, "brain": m.get("brain"),
-           "hash_file": m.get("hash_file"), "base_sha": ctx.base_sha, "head_sha": m.get("head_sha") or "",
-           "fatti": m.get("fatti") or [], "esito": choice, "motivo": m.get("motivo") or "",
+           "versione": version, "hash_file": m.get("hash_file"), "base_sha": m.get("base_sha") or ctx.base_sha,
+           "head_sha": m.get("head_sha") or "", "fatti": m.get("fatti") or [], "esito": choice, "motivo": m.get("motivo") or "",
            "contesti": ({"nuovo": contexts.get("nuovo", "non specificati"), "canon": contexts.get("canon", "non specificati")}
                         if choice == "entrambi" else {}),
            "deciso_da": decider, "revisione": f"{how} v{version}", "data": kc.logical_today().isoformat(),
@@ -2648,9 +2776,10 @@ def prepare_deciso(ctx: Ctx, tx: Tx, issue: dict, m: dict, choice: str, decider:
     return enable_automerge(ctx, pr)
 
 
-def _ensure_deciso_pr(ctx: Ctx, tx: Tx, n: int, pr: dict) -> dict:
-    """PR deciso aperta: se e' indietro rispetto a main la riallinea (merge da main, nuovo head, nuovo status, #9); garantisce
-    status e auto-merge sul head corrente."""
+def _ensure_deciso_pr(ctx: Ctx, tx: Tx, n: int, pr: dict, issue: dict | None = None, m: dict | None = None) -> dict:
+    """PR deciso aperta: se e' indietro rispetto a main la riallinea (merge da main) e RIVALUTA il file deciso contro il canon
+    nuovo (#9): una contraddizione diversa dalle triple decise = nessun success, PR chiusa, file di nuovo in attesa, issue
+    rinnovata (versione+1, `in-applicazione` tolto, commento) -> nuova decisione. Altrimenti status e auto-merge sul head."""
     branch = BRANCH_DECISO.format(issue=n)
     remote = f"refs/remotes/origin/{branch}"
     head = str(pr.get("headRefOid") or "")
@@ -2660,10 +2789,14 @@ def _ensure_deciso_pr(ctx: Ctx, tx: Tx, n: int, pr: dict) -> dict:
         else:
             tx.checkout(remote)
         wt = tx.worktree
-        m = git(wt, "merge", "--no-edit", "-q", "refs/remotes/origin/main")
-        if m.returncode != 0:
+        mg = git(wt, "merge", "--no-edit", "-q", "refs/remotes/origin/main")
+        if mg.returncode != 0:
             git(wt, "merge", "--abort")
             raise Stop(EXIT_STOP, f"PR deciso #{pr.get('number')}: merge di origin/main con conflitti, risolvi a mano ({pr.get('url', '')})")
+        if m and m.get("kind") == "travaso" and issue is not None:
+            renewed = _reevaluate_decision(ctx, tx, wt, n, pr, issue, m)
+            if renewed is not None:
+                return renewed
         outgoing_or_refuse(ctx, wt)
         push_branch(ctx, wt, branch)
         head = git_out(wt, "rev-parse", "HEAD")
@@ -2671,6 +2804,33 @@ def _ensure_deciso_pr(ctx: Ctx, tx: Tx, n: int, pr: dict) -> dict:
     if head and not _has_status(ctx, head):
         post_status(ctx, head, "success", f"deciso in #{n}; base:{ctx.base_sha[:7]}")
     return enable_automerge(ctx, pr)
+
+
+def _reevaluate_decision(ctx: Ctx, tx: Tx, wt: Path, n: int, pr: dict, issue: dict, m: dict) -> dict | None:
+    """#9: dopo il merge da main, il file deciso deve contraddire SOLO le triple gia' decise. Nuova contraddizione -> la
+    decisione non vale piu': PR deciso chiusa, file riportato in attesa, issue rinnovata. Ritorna la PR chiusa o None."""
+    persona, dest = str(m.get("persona") or ""), str(m.get("dest") or "")
+    r = git(wt, "cat-file", "-p", f"HEAD:{dest}")
+    if r.returncode != 0:
+        return None
+    text = repo_check.decode_text(r.stdout)
+    if text is None:
+        return None
+    canon = Canon(ctx, persona)
+    inc, _ann, _excl, _nf = canon.check_text(dest, text, persona, sha256_bytes(r.stdout))
+    decided = set(_fatti_key(m.get("fatti")))
+    new = [i for i in inc if _fatti_key([i.as_dict()])[0] not in decided and i.contro_decisione != n]
+    if not new:
+        return None
+    issue_comment(ctx, n, "nuova contraddizione arrivata su main dopo la decisione: " + "; ".join(_motivo(i) for i in new[:3])
+                  + f". La decisione v{m.get('versione')} non si applica: proposta rinnovata, serve una nuova decisione.")
+    post_status(ctx, str(pr.get("headRefOid") or ""), "failure", f"nuova contraddizione dopo la decisione #{n}: ridecidere; base:{ctx.base_sha[:7]}")
+    pr_close(ctx, int(pr["number"]), "decisione superata da una nuova contraddizione su main: la issue e' stata rinnovata.")
+    rebuild_attesa(ctx, tx, persona, {dest: r.stdout}, {dest: sha256_bytes(r.stdout)}, set(), None)
+    f = Fermo(dest, str(m.get("path") or dest), r.stdout, sha256_bytes(r.stdout), inc)
+    upsert_issues(ctx, [f], persona, str(m.get("brain") or ""), "")
+    issue_labels(ctx, n, remove=[LABEL_IN_APPLICAZIONE])
+    return {**pr, "state": "CLOSED", "renewed": True}
 
 def complete_decision(ctx: Ctx, tx: Tx, issue: dict, m: dict, pr: dict, choice: str) -> str:
     """Passi idempotenti DOPO la preparazione (anche in ripresa dopo un crash, #8): commento `preparata`, pulizia
@@ -2695,8 +2855,9 @@ def complete_decision(ctx: Ctx, tx: Tx, issue: dict, m: dict, pr: dict, choice: 
 
 
 def finalize_if_merged(ctx: Ctx, tx: Tx, issue: dict, m: dict) -> str | None:
-    """Issue con `in-applicazione`: PR deciso MERGED -> chiude la issue (`travaso-deciso`) e aggiorna lo status aggregato
-    (kind pr); OPEN -> riallinea/garantisce status e auto-merge e completa i passi mancanti; assente -> None (si riprepara)."""
+    """Issue con `in-applicazione` (lock gia' acquisito): PR deciso MERGED -> chiude la issue (`travaso-deciso`) e aggiorna
+    lo status aggregato (kind pr); OPEN -> riallinea/rivaluta, garantisce status e auto-merge, completa i passi mancanti;
+    assente -> None (si riprepara)."""
     n = int(issue["number"])
     pr = pr_for_branch(ctx, BRANCH_DECISO.format(issue=n))
     if pr is None:
@@ -2709,14 +2870,15 @@ def finalize_if_merged(ctx: Ctx, tx: Tx, issue: dict, m: dict) -> str | None:
         if m.get("kind") == "travaso" and _attesa_blob(ctx, str(m.get("persona") or ""), str(m.get("dest") or "")) is not None:
             complete_decision(ctx, tx, issue, m, pr, choice)
         issue_labels(ctx, n, add=[LABEL_DECISO], remove=[LABEL_DA_DECIDERE, LABEL_IN_APPLICAZIONE])
-        if not ctx.dry:
-            _gh_write(ctx, f"chiusura della issue #{n}", "issue", "close", str(n), "--repo", ctx.full, "--comment",
-                      f"travaso-stato: applicata ({sha[:7]}) — PR #{pr['number']} fusa; decisione nel registro `{REGISTER_DIR}/{n}.yaml`.")
+        issue_comment(ctx, n, f"travaso-stato: applicata ({sha[:7]}) — PR #{pr['number']} fusa; decisione nel registro `{REGISTER_DIR}/{n}.yaml`.")
+        issue_close(ctx, n)                                   # REST (fatto live: niente `gh issue close`)
         if m.get("kind") == "pr":
             refresh_pr_status(ctx, int(m.get("pr") or 0), str(m.get("head_sha") or ""))
         return f"#{n} applicata (PR #{pr['number']} fusa): issue chiusa"
     if st == "OPEN":
-        pr = _ensure_deciso_pr(ctx, tx, n, pr)
+        pr = _ensure_deciso_pr(ctx, tx, n, pr, issue, m)
+        if pr.get("renewed"):
+            return f"#{n}: proposta rinnovata (nuova contraddizione su main), serve una nuova decisione"
         complete_decision(ctx, tx, issue, m, pr, choice)
         return f"#{n} preparata (PR #{pr['number']} in attesa dei check)"
     return None
@@ -2740,8 +2902,10 @@ def _choice_from_comments(issue: dict) -> str:
             return mk.group(1)
     return ""
 
-def apply_decisions(ctx: Ctx, tx: Tx, quiet_lines: bool = False) -> list[str]:
+def apply_decisions(ctx: Ctx, tx: Tx, quiet_lines: bool = False, sblocca: int | None = None) -> list[str]:
     out: list[str] = []
+    if sblocca:
+        out.append(tx.sblocca(int(sblocca)))
     issues = list_issues(ctx, [LABEL_DA_DECIDERE])
     for issue in issues:
         n = int(issue["number"])
@@ -2749,7 +2913,17 @@ def apply_decisions(ctx: Ctx, tx: Tx, quiet_lines: bool = False) -> list[str]:
         if not m or m.get("kind") not in ("travaso", "pr"):
             continue
         if LABEL_IN_APPLICAZIONE in _labels(issue):
-            res = finalize_if_merged(ctx, tx, issue, m)
+            # ripresa: anche lei acquisisce il lock (#8); occupato = un'altra corsa sta gia' riprendendo
+            if ctx.dry:
+                out.append(f"[dry-run-git] #{n}: in applicazione, nessuna mutazione")
+                continue
+            if not tx.acquire_lock(n, {"runner": ctx.login, "ts": time.time(), "issue": n, "ripresa": True}):
+                out.append(f"#{n}: in applicazione da un'altra corsa, saltata")
+                continue
+            try:
+                res = finalize_if_merged(ctx, tx, issue, m)
+            finally:
+                tx.release_lock(LOCK_REF.format(issue=n))
             if res:
                 out.append(res)
                 continue
@@ -2793,6 +2967,9 @@ def apply_decisions(ctx: Ctx, tx: Tx, quiet_lines: bool = False) -> list[str]:
             issue_comment(ctx, n, f"travaso-stato: acquisita (vale {choice}, {how} v{version} di @{decider}, runner @{ctx.login})")
             fault("dopo-acquisita")
             pr = prepare_deciso(ctx, tx, issue, m, choice, decider, how, version)
+            if pr.get("renewed"):
+                out.append(f"#{n}: proposta rinnovata (nuova contraddizione su main), serve una nuova decisione")
+                continue
             fault("dopo-preparata")
             out.append(complete_decision(ctx, tx, issue, m, pr, choice))
         finally:
@@ -2830,7 +3007,7 @@ def cmd_decisioni(a) -> int:
         raise Stop(EXIT_DEST, f"l'account `{ctx.login}` non ha permesso di scrittura su {ctx.full}")
     tx = Tx(ctx)
     try:
-        res = apply_decisions(ctx, tx)
+        res = apply_decisions(ctx, tx, sblocca=getattr(a, "sblocca", None))
     finally:
         tx.close()
     lines = [f"Decisioni su {ctx.full}: " + ("; ".join(res) if res else "nessuna da applicare")]
@@ -2863,9 +3040,48 @@ def _persona_for_login(ctx: Ctx, explicit: str | None) -> str:
     raise Stop(EXIT_DEST, f"il login `{ctx.login}` ha piu' persone ({', '.join(mine)}): --persona obbligatoria (brain.yaml travaso.persona)")
 
 
+class CodeownersError(ValueError):
+    pass
+
+
+def _codeowners_match(pattern: str, path: str) -> bool:
+    """Semantica di GitHub/gitignore (N5): `/docs/` ancorato alla radice e tutto il contenuto; `docs/` ovunque; `*` non
+    attraversa `/`; `**` si'; `?` un carattere; un pattern senza `/` combacia a qualunque profondita'. Sintassi non
+    supportata (`!`, `[...]`, `\\`) -> CodeownersError."""
+    pat = pattern.strip()
+    if not pat or pat.startswith("!") or "[" in pat or "\\" in pat:
+        raise CodeownersError(pattern)
+    anchored = pat.startswith("/")
+    pat = pat.lstrip("/")
+    dir_only = pat.endswith("/")
+    pat = pat.rstrip("/")
+    if not anchored and "/" not in pat:
+        pat = "**/" + pat
+    rx = ""
+    i = 0
+    while i < len(pat):
+        ch = pat[i]
+        if pat.startswith("**/", i):
+            rx += "(?:.*/)?"
+            i += 3
+            continue
+        if pat.startswith("**", i):
+            rx += ".*"
+            i += 2
+            continue
+        if ch == "*":
+            rx += "[^/]*"
+        elif ch == "?":
+            rx += "[^/]"
+        else:
+            rx += re.escape(ch)
+        i += 1
+    return re.match("^" + rx + "(?:/.*)?$", path) is not None        # cio' che combacia con una cartella copre il contenuto
+
+
 def _codeowner_teams(ctx: Ctx, path: str) -> list[str]:
-    """Team proprietari di `path` secondo CODEOWNERS su origin/main (vince l'ULTIMA regola che combacia, come GitHub);
-    nessuna regola = `direzione` (N5)."""
+    """Team proprietari di `path` secondo CODEOWNERS su origin/main: vince l'ULTIMA regola che combacia (come GitHub);
+    nessuna regola = `direzione`. Una regola non interpretabile -> CodeownersError (N5)."""
     raw = show_main(ctx, ".github/CODEOWNERS")
     teams: list[str] = []
     if raw is None:
@@ -2874,8 +3090,11 @@ def _codeowner_teams(ctx: Ctx, path: str) -> list[str]:
         parts = ln.split()
         if not parts or parts[0].startswith("#"):
             continue
-        pat = parts[0].strip("/")
-        if pat == "*" or path == pat or path.startswith(pat.rstrip("/") + "/") or path.endswith("/" + pat):
+        try:
+            hit = _codeowners_match(parts[0], path)
+        except CodeownersError as e:
+            raise CodeownersError(ln.strip()) from e
+        if hit:
             owners = [t.split("/", 1)[1] for t in parts[1:] if t.startswith("@") and "/" in t]
             if owners:
                 teams = owners
@@ -2885,6 +3104,12 @@ def _codeowner_teams(ctx: Ctx, path: str) -> list[str]:
 def _codeowner_team(ctx: Ctx, path: str) -> str:
     return _codeowner_teams(ctx, path)[0]
 
+
+def _teams_label(ctx: Ctx, path: str) -> str:
+    try:
+        return "/".join(_codeowner_teams(ctx, path))
+    except CodeownersError as e:
+        return f"regola CODEOWNERS non interpretabile: {e}"
 
 def _member_of(ctx: Ctx, login: str, team: str) -> bool:
     data = ctx.gh_json("api", f"orgs/{ctx.org}/teams/{team}/memberships/{login}")
@@ -2918,6 +3143,16 @@ def refresh_pr_status(ctx: Ctx, pr_number: int, head: str) -> tuple[bool, str]:
     return ok, desc
 
 
+def _register_matches_proposal(reg: dict, m: dict) -> bool:
+    """N3: il registro autorizza SOLO la proposta identica: issue, versione, hash_file, base_sha, head_sha, fatti."""
+    if not reg or not m:
+        return False
+    same = (str(reg.get("issue")) == str(m.get("issue") or reg.get("issue")) and str(reg.get("versione") or "") == str(m.get("versione") or "")
+            and str(reg.get("hash_file") or "") == str(m.get("hash_file") or "") and str(reg.get("base_sha") or "") == str(m.get("base_sha") or "")
+            and str(reg.get("head_sha") or "") == str(m.get("head_sha") or "") and _fatti_key(reg.get("fatti")) == _fatti_key(m.get("fatti")))
+    return same
+
+
 def pr_assessment(ctx: Ctx, pr_number: int, head: str, paths: list[str], approved: set[str], n_facts: int = 0,
                   approver: str = "") -> tuple[bool, str]:
     reasons: list[str] = []
@@ -2927,29 +3162,36 @@ def pr_assessment(ctx: Ctx, pr_number: int, head: str, paths: list[str], approve
     protected = [p for p in paths if _is_protected(p)]
     unauthorized = [p for p in protected if p not in approved]
     if unauthorized:
-        reasons.append("zona protetta non autorizzata: " + ", ".join(f"{p} (team {'/'.join(_codeowner_teams(ctx, p))})" for p in unauthorized[:4])
+        reasons.append("zona protetta non autorizzata: " + ", ".join(f"{p} (team {_teams_label(ctx, p)})" for p in unauthorized[:4])
                        + f" -> `check --pr {pr_number} --approvo` da un membro di quei team")
     open_issues = [i for i in list_issues(ctx, [LABEL_DA_DECIDERE]) if (machine_of(i) or {}).get("kind") == "pr"
                    and str((machine_of(i) or {}).get("head_sha")) == head]
     pending = [i for i in open_issues if LABEL_IN_APPLICAZIONE not in _labels(i)]
     if pending:
         reasons.append(f"{len(pending)} pezzi fermi: " + " ".join(f"#{i['number']}" for i in pending))
-    decided_nums = [int(i["number"]) for i in open_issues if LABEL_IN_APPLICAZIONE in _labels(i)]
+    decided: list[tuple[int, dict]] = [(int(i["number"]), machine_of(i) or {}) for i in open_issues if LABEL_IN_APPLICAZIONE in _labels(i)]
     for i in list_issues(ctx, [LABEL_DECISO], state="closed"):
         mm = machine_of(i) or {}
         if mm.get("kind") == "pr" and str(mm.get("head_sha")) == head:
-            decided_nums.append(int(i["number"]))
-    not_integrated = [n for n in decided_nums if not _register_entry_on_main(ctx, n)]
-    if not_integrated:
-        reasons.append("registro non integrato su main: " + " ".join(f"#{n}" for n in sorted(set(not_integrated))))
-    for n in decided_nums:
+            decided.append((int(i["number"]), mm))
+    seen: set[int] = set()
+    for n, mm in decided:
+        if n in seen:
+            continue
+        seen.add(n)
         reg = _register_entry_on_main(ctx, n)
-        if reg and str(reg.get("esito")) == "canon":
+        if not reg:
+            reasons.append(f"registro non integrato su main: #{n}")
+            continue
+        if not _register_matches_proposal(reg, mm):
+            reasons.append(f"registro di #{n} non coincide con la proposta corrente (versione/hash/base/head/fatti): nuova decisione")
+            continue
+        if str(reg.get("esito")) == "canon":
             reasons.append(f"vale il canon per #{n}: il contenuto della PR va corretto")
     head_txt = f"zona protetta approvata da @{approver or '?'}: {', '.join(sorted(approved))}; " if approved else ""
     if reasons:
         return False, head_txt + "; ".join(reasons) + f"; base:{ctx.base_sha[:7]}"
-    decided_txt = (f"decisioni integrate: {' '.join(f'#{n}' for n in sorted(set(decided_nums)))}; " if decided_nums else "")
+    decided_txt = (f"decisioni integrate: {' '.join(f'#{n}' for n in sorted(seen))}; " if seen else "")
     return True, head_txt + decided_txt + status_description(True, len(paths), [], n_facts, "non verificata (brain aziendale)", ctx.base_sha)
 
 def _is_protected(path: str) -> bool:
@@ -2979,13 +3221,14 @@ def cmd_check(a) -> int:
         code = _check_pr(ctx, tx, a, persona, es) if a.pr else _check_staged(ctx, tx, persona, es)
     except Stop as e:
         es.data["note"].append(e.msg)
-        es.write(e.code)
+        if not ctx.dry:
+            es.write(e.code)
         raise
     finally:
         tx.close()
-    es.write(code)
+    if not ctx.dry:                                        # #12: in dry nessun esito su disco
+        es.write(code)
     return code
-
 
 def _file_persona(ctx: Ctx, path: str, text: str) -> str:
     """Autore del file per 'stessa persona = aggiornamento' (#11): provenienza del path o della nota, non il verificatore."""
@@ -3004,6 +3247,13 @@ def _file_persona(ctx: Ctx, path: str, text: str) -> str:
     return mk.group(1) if mk else ""
 
 
+def _pr_head_now(ctx: Ctx, number: int) -> str:
+    view = ctx.gh_json("pr", "view", str(number), "--repo", ctx.full, "--json", "headRefOid,state")
+    if not view:
+        raise Stop(EXIT_DEST, f"PR #{number} non piu' leggibile")
+    return str(view.get("headRefOid") or "")
+
+
 def _check_pr(ctx: Ctx, tx: Tx, a, persona: str, es: Esito) -> int:
     pr = ctx.gh_json("pr", "view", str(a.pr), "--repo", ctx.full, "--json", "number,state,headRefOid,headRefName,baseRefName,url,files,title")
     if not pr:
@@ -3015,11 +3265,20 @@ def _check_pr(ctx: Ctx, tx: Tx, a, persona: str, es: Esito) -> int:
         raise Stop(EXIT_STOP, f"PR #{a.pr} e' una PR del travaso ({branch}): si decide con la issue da-decidere e la gestisce "
                               "`send`/`decisioni`, nessuno status da `check --pr` (N2)")
     head = str(pr.get("headRefOid") or "")
-    ref = f"refs/remotes/origin/{branch}"
-    if not ctx.run.has_ref(ref) or git_out(ctx.clone, "rev-parse", ref) != head:
-        f = ctx.run.git("fetch", "origin", "--quiet", branch)
-        if f.returncode == 0:
-            ref = "FETCH_HEAD"
+    if ctx.dry:
+        ref = f"refs/remotes/origin/{branch}" if ctx.run.has_ref(f"refs/remotes/origin/{branch}") else "refs/remotes/origin/main"
+    else:
+        # N6: fetch OBBLIGATORIO del branch della PR; fallito = stop (mai proseguire su un ref vecchio); FETCH_HEAD = head letto
+        f = ctx.run.git("fetch", "origin", "--quiet", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+        if f.returncode != 0:
+            err = (f.stderr or "").lower()
+            if "couldn't find remote ref" in err or "not found" in err:
+                raise Stop(EXIT_DEST, f"branch della PR #{a.pr} (`{branch}`) assente su origin: {_out(f.stderr.strip(), 120)}")
+            raise Stop(EXIT_DEFERRED, f"travaso rinviato: fetch del branch `{branch}` fallito (offline?): {_out(f.stderr.strip(), 120)}")
+        fetched = git_out(ctx.clone, "rev-parse", f"refs/remotes/origin/{branch}")
+        if fetched != head:
+            raise Stop(EXIT_STOP, f"PR #{a.pr}: il branch `{branch}` e' a {fetched[:7]} ma la PR dichiara {head[:7]}: la PR si e' mossa, rilancia")
+        ref = f"refs/remotes/origin/{branch}"
     paths = [str(x.get("path")) for x in pr.get("files") or []]
     protected = [p for p in paths if _is_protected(p)]
     canon = Canon(ctx, "")
@@ -3045,11 +3304,14 @@ def _check_pr(ctx: Ctx, tx: Tx, a, persona: str, es: Esito) -> int:
     approved = _approved_zones_from_statuses(ctx, head)
     approver = ""
     if protected and a.approvo:
-        # N5: chi approva deve appartenere al team code owner di OGNI zona protetta della PR; un'approvazione parziale non
-        # si registra (le zone scoperte restano in failure con l'elenco), nessuna copertura = exit 9
-        covered = [p for p in protected if any(_member_of(ctx, ctx.login, t) for t in _codeowner_teams(ctx, p))]
+        # N5: chi approva deve appartenere al team code owner di OGNI zona protetta della PR (CODEOWNERS come GitHub)
+        try:
+            owners = {p: _codeowner_teams(ctx, p) for p in protected}
+        except CodeownersError as e:
+            raise Stop(EXIT_DEST, f"--approvo rifiutato: regola CODEOWNERS non interpretabile: {e}")
+        covered = [p for p in protected if any(_member_of(ctx, ctx.login, t) for t in owners[p])]
         if not covered:
-            zones = ", ".join(f"{p} (team {'/'.join(_codeowner_teams(ctx, p))})" for p in protected[:4])
+            zones = ", ".join(f"{p} (team {'/'.join(owners[p])})" for p in protected[:4])
             raise Stop(EXIT_DEST, f"--approvo: `{ctx.login}` non e' membro attivo di nessun team code owner delle zone protette "
                                   f"({zones}): nessuno status")
         if len(covered) == len(protected):
@@ -3057,16 +3319,21 @@ def _check_pr(ctx: Ctx, tx: Tx, a, persona: str, es: Esito) -> int:
             approver = ctx.login
         else:
             es.data["note"].append(f"--approvo di {ctx.login} insufficiente: copre {len(covered)}/{len(protected)} zone protette")
-    if fermi:
+    if fermi and not ctx.dry:
         upsert_issues(ctx, fermi, persona, ctx.brain_id, str(pr.get("url") or ""))
     es.data["fermi"] = [{"path": f.src_rel, "issue": f.issue, "motivi": [_motivo(i) for i in f.incongruenze]} for f in fermi]
     es.data["copertura"] = {"fatti": n_facts, "semantica": "non verificata (controllo del brain aziendale)", "binari_non_scansionati": 0}
     ok, desc = pr_assessment(ctx, int(pr["number"]), head, paths, approved, n_facts, approver or (ctx.login if approved else ""))
+    if not ctx.dry:
+        fault("prima-dello-status", str(ctx.clone))
+        now = _pr_head_now(ctx, int(pr["number"]))          # N6: status SOLO sullo sha ricontrollato un istante prima
+        if now != head:
+            raise Stop(EXIT_STOP, f"PR #{a.pr}: la PR si e' mossa ({head[:7]} -> {now[:7]}) prima dello status: nessuno status, rilancia")
     post_status(ctx, head, "success" if ok else "failure", desc)
     if ok:
         line = f"PR #{a.pr}: status coerenza SUCCESS su {head[:7]} ({len(paths)} file; fatti: {n_facts})"
     else:
-        line = f"PR #{a.pr}: status coerenza FAILURE — {desc}" + (": " + ", ".join(f"{f.src_rel} → #{f.issue}" for f in fermi) if fermi else "")
+        line = f"PR #{a.pr}: status coerenza FAILURE — {desc}"
         if fermi:
             line = f"PR #{a.pr}: status coerenza FAILURE — {len(fermi)} file con incongruenze: " + ", ".join(f"{f.src_rel} → #{f.issue}" for f in fermi) + f"; {desc}"
     es.emit([line])
@@ -3109,6 +3376,12 @@ def _check_staged(ctx: Ctx, tx: Tx, persona: str, es: Esito) -> int:
         return 0
     for f in fermi:
         git(ctx.clone, "restore", "--staged", "--", f.src_rel)
+    fault("dopo-restore-staged", str(ctx.clone))
+    still = [x.decode("utf-8", "replace") for x in git(ctx.clone, "diff", "--cached", "--name-only", "-z").stdout.split(b"\0") if x]
+    left = [f.src_rel for f in fermi if f.src_rel in still]
+    if left:                                              # #11: i fermi devono essere DAVVERO fuori dallo staging
+        raise Stop(EXIT_STOP, f"file incongruenti ancora in staging dopo il ritiro ({', '.join(left[:3])}): nessun commit, "
+                              "svuota lo staging e rilancia")
     pr_att, head_att, in_attesa, att_staged = rebuild_attesa(ctx, tx, persona, {f.dest: f.data for f in fermi},
                                                              {f.dest: f.sha256 for f in fermi}, set(), None)
     if in_attesa:
@@ -3184,9 +3457,10 @@ def cmd_stato(a) -> int:
 
 
 def _da_compilare(ctx: Ctx) -> list[str]:
-    """Fonti travasate (sul clone) da compilare (par. 14.17, #17): mai citate con `source:`, oppure citate ma con impronta
-    diversa (`provenienza.sha` della nota = sha256 del raw, anche prefisso); senza impronta si ripiega sulle date."""
-    cited: dict[str, list[tuple[str, str, str]]] = {}
+    """Fonti travasate (sul clone) da compilare (par. 14.17, #17): mai citate con `source:`; citate con impronta
+    `provenienza.sha` diversa dallo sha256 del raw (anche prefisso); citate SENZA impronta = "impronta assente: da compilare"
+    (nessun ripiego per data)."""
+    cited: dict[str, list[tuple[str, str]]] = {}
     for n in ctx.nodes:
         for p in kc.iter_notes(n, ctx.nodes):
             try:
@@ -3196,7 +3470,7 @@ def _da_compilare(ctx: Ctx) -> list[str]:
             pv = fm.get("provenienza") if isinstance(fm.get("provenienza"), dict) else {}
             for s in (x.strip() for x in kc.fm_str(fm.get("source")).split(";") if x.strip()):
                 if s.startswith(ZONE + "/"):
-                    cited.setdefault(s, []).append((n.rel_root(p), kc.fm_str(fm.get("updated")), kc.fm_str(pv.get("sha"))))
+                    cited.setdefault(s, []).append((n.rel_root(p), kc.fm_str(pv.get("sha"))))
     todo: list[str] = []
     for p in kc.iter_travaso_files(ctx.clone):
         rel = p.relative_to(ctx.clone).as_posix()
@@ -3207,17 +3481,12 @@ def _da_compilare(ctx: Ctx) -> list[str]:
         if not notes:
             todo.append(f"{rel} (mai compilata; sha {sha[:12]})")
             continue
-        stale = []
-        for nota, upd, fp in notes:
-            if fp:
-                if not sha.startswith(fp.lower()):
-                    stale.append(nota)
-            else:
-                last = git_out(ctx.clone, "log", "-1", "--format=%cs", "--", rel)
-                if last and upd and upd < last:
-                    stale.append(nota)
+        stale = [nota for nota, fp in notes if fp and not sha.startswith(fp.lower())]
+        missing = [nota for nota, fp in notes if not fp]
         if stale:
             todo.append(f"{rel} (cambiata: sha {sha[:12]}; note da aggiornare: {', '.join(stale)})")
+        elif missing:
+            todo.append(f"{rel} (impronta assente: da compilare con provenienza.sha {sha[:12]} in {', '.join(missing)})")
     return [f"Da compilare ({len(todo)}): " + ("; ".join(todo[:6]) + (" ..." if len(todo) > 6 else "") if todo else "niente")]
 
 def cmd_verifica(a) -> int:
@@ -3333,6 +3602,7 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("decisioni", help="applica le decisioni prese nelle issue da-decidere")
     common(d)
     d.add_argument("--scrivi", action="store_true", help="rigenera decisioni/TRAVASO.md dal registro")
+    d.add_argument("--sblocca", type=int, default=None, help="issue il cui lock stantio va tolto a mano (processo morto), poi applica")
     st = sub.add_parser("stato", help="ultimo travaso, PR aperte, pezzi fermi, decisioni")
     common(st)
     st.add_argument("--from", dest="from_", default=None)
