@@ -1,0 +1,43 @@
+# brain.config.yaml - copia PORTABILE (Brain Builder v3.2): le chiavi della macchina (root, python,
+# memory_dir, guard, federation.registry, travaso.clone) sono vuote o assenti; scaffold/inizializza_clone.py le
+# rimette sulla macchina che clona il brain (--travaso-clone, --travaso-persona) e rigenera i file locali
+# (settings, skill, manifest, CLAUDE.md, brain.yaml).
+config_version: 1
+brain_id: aziendale
+name: 'Brain aziendale fittizio: riceve il travaso dei brain personali'
+mode: federated
+kind: company
+root: ''
+master_root: ''
+template_version: 3.2.1-rc1
+agents:
+- claude
+- codex
+git:
+  init: true
+  remote: ''
+  branch: main
+python: ''
+qdrant:
+  collection: aziendale_brain
+guard:
+  home: ''
+  protected_roots: []
+github:
+  mode: org
+  owner: kebucc-brain-lab
+  repo: aziendale
+  visibility: public
+  role: area
+  merge: coerenza
+  travaso: true
+  codeowners:
+  - path: /.github/
+    teams:
+    - direzione
+  - path: /scripts/
+    teams:
+    - direzione
+  - path: /docs/
+    teams:
+    - direzione

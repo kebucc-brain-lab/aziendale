@@ -1,0 +1,16 @@
+# travaso.yaml - chi travasa in questo brain e chi decide (Brain Builder v3.3, SPEC v3.3 par. 7.3, 14.1, 14.4).
+# DERIVATO da org.yaml: lo rende `github_org.py scaffold` e lo riallinea `github_org.py apply` nel clone locale; si
+# modifica cambiando org.yaml, poi si committa con brain_sync (e' una zona protetta: la PR passa con
+# `travaso.py check --pr <n> --approvo` da un membro del team code owner). Portabile: niente path di macchina.
+# `verifica_semantica`: richiesta (default) = nessun file entra senza il verdetto dell'agente di chi manda;
+#   facoltativa = i file senza verdetto entrano con label `semantica-non-verificata` (solo per sorgenti senza agente).
+# `persone.<p>.brains`: allow-list dei brain sorgente della persona (obbligatoria in production).
+# `responsabile_default`: riceve una issue SOLO quando l'area del canon contraddetto e' davvero ignota
+#   (nota canon senza `provenienza` e fuori da sources/travaso/<altra persona>/); altrimenti decide il responsabile dell'area.
+org: "kebucc-brain-lab"
+repo: "aziendale"
+verifica_semantica: richiesta
+persone: {}
+aree: {}
+responsabile_default: ""
+aggiornato: 2026-10-21

@@ -1,0 +1,9 @@
+# CODEOWNERS del brain aziendale (https://github.com/kebucc-brain-lab/aziendale) - generato dal Brain Builder da org.yaml.
+# Zona -> team responsabili (devono avere almeno Write sul repo e non essere team secret).
+# Brain a coerenza (merge coerenza, SPEC v3.3 par. 14.20): la review di un code owner NON e' richiesta dal
+# ruleset; le zone qui sotto sono le zone PROTETTE: una PR che le tocca resta ferma finche' un membro del
+# team non esegue `travaso.py check --pr <n> --approvo`.
+# Si modifica solo con una PR; i team si cambiano in org.yaml e si riallineano con github_org.py apply.
+/.github/ @kebucc-brain-lab/direzione
+/scripts/ @kebucc-brain-lab/direzione
+/docs/ @kebucc-brain-lab/direzione
