@@ -55,7 +55,17 @@ SESSIONS_PREFIX = "workspace/journal/sessions"
 # v3.3 (SPEC v3.3 par. 4, 14.17): `zone` vault | travaso; per la zona `sources/travaso/<persona>/<brain>/**` del nodo radice
 # anche `persona` e `brain_src` (provenienza), cosi' il brain aziendale risponde subito con il materiale travasato.
 PAYLOAD_KEYS = ("stem", "path", "node_path", "brain_id", "title", "summary", "heading",
-                "text", "is_view", "is_session", "zone", "persona", "brain_src")
+                "text", "is_view", "is_session", "zone", "persona", "brain_src", "superato")
+_MARKS: dict[str, dict[str, str]] = {}    # cache per radice: registro delle decisioni (giro 2, #6)
+
+
+def _marks(root: Path | None) -> dict[str, str]:
+    if root is None:
+        return {}
+    key = str(root)
+    if key not in _MARKS:
+        _MARKS[key] = kc.register_marks(root)
+    return _MARKS[key]
 
 
 # ----------------------------------------------------------------------------
@@ -109,7 +119,7 @@ def _split_long(txt: str):
     return parts
 
 
-def chunk_note(path: Path, relp: str, node_path: str, bid: str, text: str | None = None):
+def chunk_note(path: Path, relp: str, node_path: str, bid: str, text: str | None = None, root: Path | None = None):
     if text is None:
         text = kc.read_text(path)
     if text.startswith("﻿"):
@@ -120,6 +130,7 @@ def chunk_note(path: Path, relp: str, node_path: str, bid: str, text: str | None
     summary = meta.get("summary", "")
     prov = kc.travaso_provenance(relp)
     zone, persona, brain_src = ("travaso", prov[0], prov[1]) if prov else ("vault", "", "")
+    superato = _marks(root).get(relp, "")
     chunks = []
     for heading, sec in _sections(body):
         for piece in _split_long(sec):
@@ -134,7 +145,7 @@ def chunk_note(path: Path, relp: str, node_path: str, bid: str, text: str | None
                 "title": title, "summary": summary, "heading": heading,
                 "text": piece, "embed_text": embed_text,
                 "is_view": False, "is_session": _is_session(relp, node_path),
-                "zone": zone, "persona": persona, "brain_src": brain_src,
+                "zone": zone, "persona": persona, "brain_src": brain_src, "superato": superato,
             })
     return chunks
 
@@ -336,7 +347,7 @@ def run(root: Path, node_paths=None, scope: str | None = None, rebuild: bool = F
         total = sum(len(j.changed) for j in jobs)
         for j in jobs:
             for relp in j.changed:
-                chunks = chunk_note(j.files[relp], relp, j.node.path, bid, j.texts[relp])
+                chunks = chunk_note(j.files[relp], relp, j.node.path, bid, j.texts[relp], root=root)
                 if chunks:
                     dv = de.encode([c["embed_text"] for c in chunks], kind="passage")
                     sv = sp.encode([c["embed_text"] for c in chunks], kind="passage")
@@ -372,7 +383,7 @@ def run(root: Path, node_paths=None, scope: str | None = None, rebuild: bool = F
             j.new_files = {r: v for r, v in j.prev_files.items()
                            if r not in set(j.changed) | set(j.removed)}
             for i, relp in enumerate(j.changed, 1):
-                chunks = chunk_note(j.files[relp], relp, j.node.path, bid, j.texts[relp])
+                chunks = chunk_note(j.files[relp], relp, j.node.path, bid, j.texts[relp], root=root)
                 # delete per-file appena prima dell'upsert: serve solo per gli orfani
                 # (nota accorciata); gli id deterministici sovrascrivono il resto.
                 store.delete_paths([relp])
